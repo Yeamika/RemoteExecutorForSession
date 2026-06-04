@@ -22,6 +22,10 @@ fn string_enum_default(values: &[&str], default: &str) -> Value {
     json!({ "type": "string", "enum": values, "default": default })
 }
 
+fn string_enum_default_desc(description: &str, values: &[&str], default: &str) -> Value {
+    json!({ "type": "string", "description": description, "enum": values, "default": default })
+}
+
 fn integer_prop(description: &str) -> Value {
     json!({ "type": "integer", "description": description })
 }
@@ -43,14 +47,22 @@ fn object_prop(additional: &str) -> Value {
 }
 
 fn exec_session_prop() -> (String, Value) {
-    prop(EXECUTOR_SESSION_PARAM, string_prop("OpenCode executor/session routing id"))
+    prop(
+        EXECUTOR_SESSION_PARAM,
+        string_prop("OpenCode executor/session routing id"),
+    )
 }
 
 fn executor_prop() -> (String, Value) {
     prop("executor", string_default("Target executor id", "local"))
 }
 
-fn tool_def(name: &str, description: &str, required: Vec<&str>, properties: Vec<(String, Value)>) -> McpToolDef {
+fn tool_def(
+    name: &str,
+    description: &str,
+    required: Vec<&str>,
+    properties: Vec<(String, Value)>,
+) -> McpToolDef {
     let mut props = Map::new();
     for (k, v) in properties {
         props.insert(k, v);
@@ -95,17 +107,34 @@ fn tool_def(name: &str, description: &str, required: Vec<&str>, properties: Vec<
 pub fn file_action() -> McpToolDef {
     tool_def(
         "FileAction",
-        "REC file action: patch, create, delete, or rename a file",
+        "REC file action: patch, create, delete, or rename a file. For stale-safe edits, prefer the hashRef label returned by read/FileAction, e.g. `App.ts #A1B2`, as `fileKey`; this resolves the file and applies hash checking before the mutation.",
         vec!["mode"],
         vec![
             exec_session_prop(),
             executor_prop(),
-            prop("mode", string_enum_prop(&["patch", "create", "delete", "rename"])),
-            prop("fileKey", string_prop("File key or read reference (\"App.ts #A1B2\")")),
-            prop("newFilePath", string_prop("Destination path for mode=rename")),
+            prop(
+                "mode",
+                string_enum_prop(&["patch", "create", "delete", "rename"]),
+            ),
+            prop(
+                "fileKey",
+                string_prop("Direct path, REC file key, or hashRef label. If tool output contains `<fileRef>App.ts #A1B2</fileRef>`, pass the inner `App.ts #A1B2` value here."),
+            ),
+            prop(
+                "newFilePath",
+                string_prop("Destination path for mode=rename"),
+            ),
             prop("patchText", string_prop("REC patch text for mode=patch")),
-            prop("content", string_prop("New file content for mode=create. With patchMode=binary, this is hex.")),
-            prop("patchMode", string_enum_default(&["text", "binary"], "text")),
+            prop(
+                "content",
+                string_prop(
+                    "New file content for mode=create. With patchMode=binary, this is hex.",
+                ),
+            ),
+            prop(
+                "patchMode",
+                string_enum_default(&["text", "binary"], "text"),
+            ),
         ],
     )
 }
@@ -137,15 +166,24 @@ pub fn file_action() -> McpToolDef {
 pub fn read() -> McpToolDef {
     tool_def(
         "read",
-        "Read a file via REC. Supports file references (\"filename #ABCD\") and direct paths.",
+        "Read a file via REC. Accepts direct paths, REC file keys, and hashRef labels such as `filename #ABCD`. File reads may return `<fileRef>filename #ABCD</fileRef>`; use that inner label as `fileKey` for later read/FileAction calls to preserve file identity and hash safety.",
         vec!["fileKey"],
         vec![
             exec_session_prop(),
             executor_prop(),
-            prop("fileKey", string_prop("File key or read reference (\"App.ts #A1B2\")")),
+            prop(
+                "fileKey",
+                string_prop("Direct path, REC file key, or hashRef label such as `App.ts #A1B2`. If a prior tool returned `<fileRef>...</fileRef>`, pass the inner label without XML tags."),
+            ),
             prop("mode", string_enum_default(&["text", "binary"], "text")),
-            prop("offset", integer_prop("Start offset. Text: 1-based line. Binary: 0-based byte.")),
-            prop("limit", integer_prop("Max items. Text: lines. Binary: bytes (max 128).")),
+            prop(
+                "offset",
+                integer_prop("Start offset. Text: 1-based line. Binary: 0-based byte."),
+            ),
+            prop(
+                "limit",
+                integer_prop("Max items. Text: lines. Binary: bytes (max 128)."),
+            ),
         ],
     )
 }
@@ -172,7 +210,7 @@ pub fn read() -> McpToolDef {
 pub fn rg() -> McpToolDef {
     tool_def(
         "rg",
-        "REC ripgrep-like search. Returns matching lines with file/line/column metadata.",
+        "REC ripgrep-like search. Returns matching lines with file/line/column metadata. Search results are paths, not hashRefs; call `read` on a path first when a later edit should use a stale-safe `fileKey`.",
         vec!["pattern"],
         vec![
             exec_session_prop(),
@@ -180,8 +218,14 @@ pub fn rg() -> McpToolDef {
             prop("pattern", string_prop("Regex pattern to search for")),
             prop("path", string_prop("Specific file or directory to search")),
             prop("globs", array_prop("string")),
-            prop("case_sensitive", boolean_default("Case-sensitive matching", true)),
-            prop("max_count", integer_prop("Maximum number of matches to return")),
+            prop(
+                "case_sensitive",
+                boolean_default("Case-sensitive matching", true),
+            ),
+            prop(
+                "max_count",
+                integer_prop("Maximum number of matches to return"),
+            ),
         ],
     )
 }
@@ -208,22 +252,40 @@ pub fn rg() -> McpToolDef {
 pub fn exbash() -> McpToolDef {
     tool_def(
         "exbash",
-        "REC exbash PTY tool. Run shell commands, attach to running sessions, list/stop/remove tasks.",
+        "PTY-backed background terminal. `shell` is the default mode and should be used for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later.",
         vec![],
         vec![
             exec_session_prop(),
             executor_prop(),
-            prop("mode", string_enum_default(&["run", "shell", "attach", "list", "stop", "remove"], "shell")),
-            prop("command", string_prop("Shell command for mode=run")),
-            prop("shell", string_default("Shell profile name for mode=shell", "auto")),
-            prop("description", string_prop("Task description")),
-            prop("timeout", integer_prop("Command timeout in milliseconds")),
-            prop("read_timeout", integer_prop("Read timeout in milliseconds")),
-            prop("asyncID", string_prop("Task ID for attach/stop/remove")),
-            prop("text", string_prop("Text to write to PTY stdin (attach mode)")),
-            prop("filePath", string_prop("File path for file-based input")),
-            prop("workdir", string_prop("Working directory for the shell command")),
-            prop("showRawPretty", boolean_prop("Show raw and pretty output")),
+            prop(
+                "mode",
+                string_enum_default_desc(
+                    "Operation selector. `shell` is the default terminal path. `run` directly starts a program and splits `command` into executable + argv without shell parsing.",
+                    &["run", "shell", "attach", "list", "stop", "remove"],
+                    "shell",
+                ),
+            ),
+            prop(
+                "command",
+                string_prop(
+                    "Command text. In `shell` mode it is sent to the configured shell profile. In `run` mode it is parsed as executable + argv and shell syntax is not interpreted.",
+                ),
+            ),
+            prop(
+                "shell",
+                string_default(
+                    "Shell profile name for `shell` mode. Empty or omitted uses the settings default.",
+                    "auto",
+                ),
+            ),
+            prop("description", string_prop("Optional display text for the run. The description is shown in run listings and detached snapshots.")),
+            prop("timeout", integer_prop("Total lifetime timeout in milliseconds. Omit, 0, or -1 to leave the run unmanaged.")),
+            prop("read_timeout", integer_prop("How long to wait before returning. If the process is still running at timeout, the tool returns a detached snapshot with `asyncID`.")),
+            prop("asyncID", string_prop("Run id returned by detached `run` or `attach`; required for `attach`, `list`, `stop`, and `remove`.")),
+            prop("text", string_prop("Text to write to PTY stdin in `attach` mode. Escape sequences such as `\\n` are interpreted.")),
+            prop("filePath", string_prop("File path for `attach` mode input. Mutually exclusive with `text`.")),
+            prop("workdir", string_prop("Working directory for `run` and `shell` commands.")),
+            prop("showRawPretty", boolean_prop("Include raw PTY text in attach metadata.")),
         ],
     )
 }
@@ -266,13 +328,24 @@ pub fn remote_executor_manager() -> McpToolDef {
         vec!["method"],
         vec![
             exec_session_prop(),
-            prop("method", string_enum_prop(&["list_executor", "connect_to_executor", "list_shells", "set_executor_shell"])),
+            prop(
+                "method",
+                string_enum_prop(&[
+                    "list_executor",
+                    "connect_to_executor",
+                    "list_shells",
+                    "set_executor_shell",
+                ]),
+            ),
             prop("id", string_prop("Executor ID")),
             prop("url", string_prop("WebSocket URL for connect_to_executor")),
             prop("system", string_prop("System label")),
             prop("device", string_prop("Device label")),
             prop("labels", object_prop("string")),
-            prop("shell", string_default("Shell profile name for set_executor_shell", "auto")),
+            prop(
+                "shell",
+                string_default("Shell profile name for set_executor_shell", "auto"),
+            ),
         ],
     )
 }

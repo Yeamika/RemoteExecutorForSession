@@ -1,9 +1,20 @@
 use remote_executor_for_session::mcp::create_session_mcp_with_manager;
 use remote_executor_for_session::demos::memory_host::MemorySessionHost;
-use remote_executor_for_session::jsonrpc::{JsonRpcEndpoint, JsonRpcHandler};
+use remote_executor_for_session::jsonrpc::JsonRpcEndpoint;
 use remote_executor_for_session::rec::{new_manager, ShellManager, ToolContext};
 use std::sync::Arc;
 use serde_json::json;
+
+fn file_ref(text: &str) -> String {
+    text.lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("<fileRef>")
+                .and_then(|value| value.strip_suffix("</fileRef>"))
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
 
 #[tokio::main]
 async fn main() {

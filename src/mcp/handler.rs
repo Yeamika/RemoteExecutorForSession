@@ -227,7 +227,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     }
                 }
                 let output_text = extract_output_text(&value);
-                Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(value) })
+                Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(strip_output(value)) })
             }
             "exbash" => {
                 let result = self.call_via_manager("exbash", arguments).await?;
@@ -236,12 +236,12 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     value["metadata"]["hostSnapshot"] = serde_json::to_value(snapshot).unwrap_or_default();
                 }
                 let output_text = extract_output_text(&value);
-                Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(value) })
+                Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(strip_output(value)) })
             }
             "rg" => {
                 let result = self.call_via_manager("rg", arguments).await?;
                 let output_text = extract_output_text(&result);
-                Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(result) })
+                Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(strip_output(result)) })
             }
             "RemoteExecutorManager" => {
                 let method = arguments.get("method").and_then(Value::as_str).unwrap_or("").to_string();
@@ -265,7 +265,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     let response = manager_handle(&manager, request).await;
                     let result = serde_json::to_value(&response).unwrap();
                     let output_text = serde_json::to_string_pretty(&result).unwrap();
-                    return Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(result) });
+                    return Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(strip_output(result)) });
                 }
                 // Other manager methods go through Caller
                 let executor = extract_executor(&mut arguments);
@@ -281,7 +281,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 let response = manager_handle(&manager, request).await;
                 let result = serde_json::to_value(&response).unwrap();
                 let output_text = serde_json::to_string_pretty(&result).unwrap();
-                Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(result) })
+                Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(strip_output(result)) })
             }
             unknown => Err(JsonRpcError::method_not_found(unknown)),
         }
@@ -306,6 +306,16 @@ fn extract_output_text(result: &Value) -> String {
         }
         _ => "".to_string(),
     }
+}
+
+/// Strip `output` from a result value before storing as structuredContent.
+/// structuredContent should only contain metadata/title for programmatic use;
+/// the model-visible output goes in content[0].text.
+fn strip_output(mut result: Value) -> Value {
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("output");
+    }
+    result
 }
 
 fn extract_executor_from_value(arguments: &Value) -> String {

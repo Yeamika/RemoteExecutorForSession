@@ -52,18 +52,43 @@ impl<H: SessionHost> SessionMcpHandler<H> {
         Ok((Value::Object(args), None))
     }
 
-    async fn store_from_result(&self, executor: &str, result: &serde_json::Value, file_key_ref: Option<&str>) -> Option<String> {
+    async fn store_from_result(&self, executor: &str, result: &serde_json::Value, _file_key_ref: Option<&str>) -> Option<String> {
         let rec = serde_json::from_value::<crate::types::RecToolResult>(result.clone()).ok()?;
         let update = extract_file_ref_update(&rec, executor)?;
-        if let Some(existing_ref) = file_key_ref {
-            if let Ok(Some(entry)) = self.host.retouch_hash_ref(existing_ref, &update.hash_code).await {
-                return Some(crate::refs::label_hash_ref(&crate::refs::basename(&entry.file_path), &crate::refs::small_hash_code(&entry.file_key_ref, &entry.hash_code)));
-            }
-        }
         if let Ok(entry) = self.host.store_hash_ref(update).await {
             return Some(crate::refs::label_hash_ref(&crate::refs::basename(&entry.file_path), &crate::refs::small_hash_code(&entry.file_key_ref, &entry.hash_code)));
         }
         None
+    }
+
+    async fn read_back_file_action_result(
+        &self,
+        mut result: Value,
+        executor: &str,
+    ) -> Value {
+        if result.pointer("/metadata/file/type").and_then(Value::as_str) == Some("delete") {
+            return result;
+        }
+        let file_path = result
+            .pointer("/metadata/file/newFilePath")
+            .or_else(|| result.pointer("/metadata/file/canonicalPath"))
+            .or_else(|| result.pointer("/metadata/file/filePath"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if file_path.is_empty() {
+            return result;
+        }
+        let read_args = json!({ "filePath": file_path, "executor": executor, "hashCheckMode": true });
+        let Ok(read_result) = self.call_via_manager("read", read_args).await else {
+            return result;
+        };
+        if let Some(hash_code) = read_result.pointer("/metadata/hashCode").cloned() {
+            result["metadata"]["hashCode"] = hash_code;
+        }
+        if let Some(file) = read_result.pointer("/metadata/file").cloned() {
+            result["metadata"]["file"] = file;
+        }
+        result
     }
 
     fn current_scope(&self) -> Option<String> {
@@ -117,12 +142,17 @@ impl<H: SessionHost> SessionMcpHandler<H> {
         remove_field(&mut arguments, "executor");
 
         let manager = self.manager.get().ok_or_else(|| JsonRpcError::internal("RemoteExecutorManager is not initialized"))?.clone();
+        let directory = if executor == "local" {
+            Some(self.ctx.directory.clone())
+        } else {
+            None
+        };
         let request = ExecutorRequest {
             id: Value::Number(1.into()),
             method: name.to_string(),
             executor: Some(executor),
             params: arguments,
-            directory: Some(self.ctx.directory.clone()),
+            directory,
             tool_timeout_ms: None,
         };
         let response = manager_handle(&manager, request).await;
@@ -156,6 +186,7 @@ fn extract_executor(arguments: &mut Value) -> String {
         return "local".to_string();
     };
     object.remove("executor")
+        .or_else(|| object.remove("targetExecutor"))
         .and_then(|v| v.as_str().map(str::to_string))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "local".to_string())
@@ -187,32 +218,10 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 let executor = extract_executor_from_value(&args);
                 // Call via Caller
                 let result = self.call_via_manager(name, args).await?;
-                // For FileAction/create, call read to get hashCode
-                let result = if name == "FileAction" && result.pointer("/metadata/file/type").and_then(Value::as_str) == Some("create") {
-                    let file_path = result.pointer("/metadata/file/canonicalPath")
-                        .or_else(|| result.pointer("/metadata/file/filePath"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    if !file_path.is_empty() {
-                        let read_args = json!({ "filePath": file_path, "executor": executor, "hashCheckMode": true });
-                        let read_result = self.call_via_manager("read", read_args).await;
-                        match read_result {
-                            Ok(read_result) => {
-                                // Merge hashCode from read into FileAction result
-                                let mut merged = result;
-                                if let Some(hash_code) = read_result.pointer("/metadata/hashCode").cloned() {
-                                    merged["metadata"]["hashCode"] = hash_code;
-                                }
-                                if let Some(file) = read_result.pointer("/metadata/file").cloned() {
-                                    merged["metadata"]["file"] = file;
-                                }
-                                merged
-                            }
-                            Err(_) => result,
-                        }
-                    } else {
-                        result
-                    }
+                // FileAction results use patch-style file metadata. Read back changed files so
+                // hashRef storage gets a canonical REC FileStamp and the latest hash.
+                let result = if name == "FileAction" {
+                    self.read_back_file_action_result(result, &executor).await
                 } else {
                     result
                 };
@@ -254,33 +263,41 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     let shell = arguments.get("shell").and_then(Value::as_str).unwrap_or("auto").to_string();
                     remove_executor_session_id(&mut arguments);
                     let manager = self.manager.get().ok_or_else(|| JsonRpcError::internal("RemoteExecutorManager is not initialized"))?.clone();
+                    let directory = if executor == "local" {
+                        Some(self.ctx.directory.clone())
+                    } else {
+                        None
+                    };
                     let request = ExecutorRequest {
                         id: Value::Number(1.into()),
                         method: "set_default_shell".to_string(),
                         executor: Some(executor),
                         params: json!({ "shell": shell }),
-                        directory: Some(self.ctx.directory.clone()),
+                        directory,
                         tool_timeout_ms: None,
                     };
                     let response = manager_handle(&manager, request).await;
                     let result = serde_json::to_value(&response).unwrap();
-                    let output_text = serde_json::to_string_pretty(&result).unwrap();
+                    let output_text = manager_output_text(&result);
                     return Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(strip_output(result)) });
                 }
                 // Other manager methods go through Caller
                 let executor = extract_executor(&mut arguments);
                 remove_executor_session_id(&mut arguments);
                 remove_field(&mut arguments, "executor");
+                remove_field(&mut arguments, "method");
                 let manager = self.manager.get().ok_or_else(|| JsonRpcError::internal("RemoteExecutorManager is not initialized"))?.clone();
-                let request = serde_json::from_value::<crate::rec::ExecutorRequest>(json!({
-                    "id": 1,
-                    "tool": method,
-                    "executor": executor,
-                    "params": arguments,
-                })).map_err(|e| JsonRpcError::internal(e.to_string()))?;
+                let request = ExecutorRequest {
+                    id: Value::Number(1.into()),
+                    method,
+                    executor: Some(executor),
+                    params: arguments,
+                    directory: None,
+                    tool_timeout_ms: None,
+                };
                 let response = manager_handle(&manager, request).await;
                 let result = serde_json::to_value(&response).unwrap();
-                let output_text = serde_json::to_string_pretty(&result).unwrap();
+                let output_text = manager_output_text(&result);
                 Ok(McpCallResult { content: vec![McpContentText { kind: "text".to_string(), text: output_text }], structured_content: Some(strip_output(result)) })
             }
             unknown => Err(JsonRpcError::method_not_found(unknown)),
@@ -308,18 +325,36 @@ fn extract_output_text(result: &Value) -> String {
     }
 }
 
+fn manager_output_text(result: &Value) -> String {
+    let text = result
+        .get("result")
+        .map(extract_output_text)
+        .filter(|text| !text.is_empty());
+    text.unwrap_or_else(|| serde_json::to_string_pretty(result).unwrap_or_default())
+}
+
 /// Strip `output` from a result value before storing as structuredContent.
 /// structuredContent should only contain metadata/title for programmatic use;
 /// the model-visible output goes in content[0].text.
 fn strip_output(mut result: Value) -> Value {
     if let Some(obj) = result.as_object_mut() {
         obj.remove("output");
+        if let Some(nested) = obj.get_mut("result") {
+            if let Some(nested_obj) = nested.as_object_mut() {
+                nested_obj.remove("output");
+            }
+        }
     }
     result
 }
 
 fn extract_executor_from_value(arguments: &Value) -> String {
-    arguments.get("executor").and_then(Value::as_str).unwrap_or("local").to_string()
+    arguments
+        .get("executor")
+        .or_else(|| arguments.get("targetExecutor"))
+        .and_then(Value::as_str)
+        .unwrap_or("local")
+        .to_string()
 }
 
 pub struct DummySessionHost;

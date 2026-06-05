@@ -579,9 +579,10 @@ pub fn rg() -> McpToolDef {
 
 /// REC exbash PTY tool. Run shell commands, attach to running sessions, list/stop/remove tasks.
 ///
+/// Local/workspace state updates are synchronized to HostIO on each update.
 /// Remote executor tracking is lazy: stored state is updated only after a
-/// successful executor call; failed remote calls leave stored state unchanged. Use
-/// `scope=remote` with a non-local `executor` to query live untracked remote
+/// successful executor call; failed remote calls leave stored state unchanged.
+/// Use `scope=remote` with a non-local `executor` to query live untracked remote
 /// tasks without changing stored tracking.
 ///
 /// Captured MCP input (mode=run, command completes immediately):
@@ -978,7 +979,7 @@ pub fn rg() -> McpToolDef {
 pub fn exbash() -> McpToolDef {
     tool_def(
         "exbash",
-        "PTY-backed background terminal. `shell` is the default mode and should be used for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Remote executor tracking is lazy: stored state is updated only after a successful executor call; failed remote calls leave stored state unchanged.",
+        "PTY-backed background terminal. `shell` is the default mode and should be used for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Local/workspace state updates are synchronized to HostIO on each update. Remote executor tracking is lazy: stored state is updated only after a successful executor call; failed remote calls leave stored state unchanged.",
         vec![],
         vec![
             exec_session_prop(),

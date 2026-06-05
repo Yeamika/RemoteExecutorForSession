@@ -579,6 +579,17 @@ pub fn rg() -> McpToolDef {
 
 /// REC exbash PTY tool. Run shell commands, attach to running sessions, list/stop/remove tasks.
 ///
+/// Task states shown in tracked lists use these protocol values:
+/// `running`, `exit:<code>`, `timeout`, and `stop`. `unknown` is only a display
+/// fallback for abnormal persisted state; REFS does not actively write it.
+///
+/// Remote executor state is lazy-tracked. Stored local/workspace entries for a
+/// remote executor keep their previous state until a real executor call succeeds.
+/// Successful `attach`, `stop`, or `remove` calls update/clear matching tracked
+/// entries. Failed remote calls leave tracked state unchanged. Use
+/// `scope=remote` with a non-local `executor` to query live untracked remote
+/// tasks without changing stored tracking.
+///
 /// Captured MCP input (run, command completes immediately):
 /// ```json
 /// {
@@ -589,7 +600,6 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
-///       "includeStructuredContent": true,
 ///       "mode": "run",
 ///       "command": "echo hello from exbash",
 ///       "read_timeout": 5000,
@@ -613,14 +623,7 @@ pub fn rg() -> McpToolDef {
 /// totaloutput:19bytes
 /// exitcode:0"
 ///       }
-///     ],
-///     "structuredContent": {
-///       "metadata": {
-///         "output": "hello from exbash
-/// ",
-///         "exitCode": 0
-///       }
-///     }
+///     ]
 ///   }
 /// }
 /// ```
@@ -635,7 +638,6 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
-///       "includeStructuredContent": true,
 ///       "mode": "shell",
 ///       "command": "echo shell-ok",
 ///       "read_timeout": 5000,
@@ -659,14 +661,7 @@ pub fn rg() -> McpToolDef {
 /// totaloutput:10bytes
 /// exitcode:0"
 ///       }
-///     ],
-///     "structuredContent": {
-///       "metadata": {
-///         "output": "shell-ok
-/// ",
-///         "exitCode": 0
-///       }
-///     }
+///     ]
 ///   }
 /// }
 /// ```
@@ -681,7 +676,6 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
-///       "includeStructuredContent": true,
 ///       "mode": "run",
 ///       "command": "sleep 5",
 ///       "read_timeout": 10,
@@ -703,32 +697,7 @@ pub fn rg() -> McpToolDef {
 ///         "text": "
 /// rex-1780576006395-3 detached"
 ///       }
-///     ],
-///     "structuredContent": {
-///       "metadata": {
-///         "asyncID": "rex-1780576006395-3",
-///         "pid": 72504,
-///         "state": "running",
-///         "totalOutput": 0,
-///         "command": "sleep 5",
-///         "description": "sleep 5",
-///         "cwd": "/tmp/refs-mcp-examples-vtOsrZ",
-///         "timeout": null,
-///         "startedAt": 1780576006396,
-///         "detached": true,
-///         "hostSnapshot": {
-///           "asyncId": "rex-1780576006395-3",
-///           "executor": "local",
-///           "sessionId": "codex-mcp-test",
-///           "state": "running",
-///           "pid": 72504,
-///           "startedAt": 1780576006396,
-///           "command": "sleep 5",
-///           "description": "sleep 5",
-///           "totalOutput": 0
-///         }
-///       }
-///     }
+///     ]
 ///   }
 /// }
 /// ```
@@ -743,7 +712,6 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
-///       "includeStructuredContent": true,
 ///       "mode": "list",
 ///       "executor": "local"
 ///     }
@@ -764,29 +732,43 @@ pub fn rg() -> McpToolDef {
 /// showing executor=local of local
 /// - local:rex-1780576006395-3 running totalOutput=0 command=sleep 5"
 ///       }
-///     ],
-///     "structuredContent": {
-///       "metadata": {
-///         "scope": "local",
-///         "executor": "local",
-///         "localCount": 1,
-///         "workspaceCount": 0,
-///         "remoteUntrackedCount": null,
-///         "tasks": [
-///           {
-///             "asyncId": "rex-1780576006395-3",
-///             "executor": "local",
-///             "sessionId": "codex-mcp-test",
-///             "state": "running",
-///             "pid": 72504,
-///             "startedAt": 1780576006396,
-///             "command": "sleep 5",
-///             "description": "sleep 5",
-///             "totalOutput": 0
-///           }
-///         ]
-///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=list, live remote view):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 5,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "list",
+///       "scope": "remote",
+///       "executor": "exec_1"
 ///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```text
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 5,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "local:1 workspace:0
+/// showing executor=exec_1 of remote
+/// - rex-1780576007000-1 running totalOutput=0 command=sleep 30"
+///       }
+///     ]
 ///   }
 /// }
 /// ```
@@ -801,7 +783,6 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
-///       "includeStructuredContent": true,
 ///       "mode": "attach",
 ///       "asyncID": "rex-1780576006395-3",
 ///       "read_timeout": 0,
@@ -822,20 +803,7 @@ pub fn rg() -> McpToolDef {
 ///         "type": "text",
 ///         "text": ""
 ///       }
-///     ],
-///     "structuredContent": {
-///       "metadata": {
-///         "asyncID": "rex-1780576006395-3",
-///         "wrote": 0,
-///         "source": "attach",
-///         "outputBytes": 0,
-///         "hostSnapshot": {
-///           "asyncId": "rex-1780576006395-3",
-///           "executor": "local",
-///           "sessionId": "codex-mcp-test"
-///         }
-///       }
-///     }
+///     ]
 ///   }
 /// }
 /// ```
@@ -850,7 +818,6 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
-///       "includeStructuredContent": true,
 ///       "mode": "stop",
 ///       "asyncID": "rex-1780576006395-3",
 ///       "executor": "local"
@@ -870,22 +837,42 @@ pub fn rg() -> McpToolDef {
 ///         "type": "text",
 ///         "text": ""
 ///       }
-///     ],
-///     "structuredContent": {
-///       "metadata": {
-///         "asyncID": "rex-1780576006395-3",
-///         "pid": 72504,
-///         "state": "stopped",
-///         "exitCode": "stopped",
-///         "totalOutput": 0,
-///         "command": "sleep 5",
-///         "description": "sleep 5",
-///         "cwd": "/tmp/refs-mcp-examples-vtOsrZ",
-///         "timeout": null,
-///         "startedAt": 1780576006396,
-///         "endedAt": 1780576006461
-///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=list, after stop):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 7,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "list",
+///       "executor": "local"
 ///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```text
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 7,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "local:1 workspace:0
+/// showing executor=local of local
+/// - local:rex-1780576006395-3 stop totalOutput=0 command=sleep 5"
+///       }
+///     ]
 ///   }
 /// }
 /// ```
@@ -900,7 +887,6 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
-///       "includeStructuredContent": true,
 ///       "mode": "remove",
 ///       "asyncID": "rex-1780576006395-3",
 ///       "executor": "local"
@@ -920,24 +906,19 @@ pub fn rg() -> McpToolDef {
 ///         "type": "text",
 ///         "text": "ok"
 ///       }
-///     ],
-///     "structuredContent": {
-///       "metadata": {
-///         "ok": true
-///       }
-///     }
+///     ]
 ///   }
 /// }
 /// ```
 pub fn exbash() -> McpToolDef {
     tool_def(
         "exbash",
-        "PTY-backed background terminal. `shell` is the default mode and should be used for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later.",
+        "PTY-backed background terminal. `shell` is the default mode and should be used for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Tracked task states are `running`, `exit:<code>`, `timeout`, or `stop`. Remote executor state is lazy-tracked: successful calls update matching tracked entries, failed remote calls leave stored state unchanged.",
         vec![],
         vec![
             exec_session_prop(),
             executor_empty_default_prop(
-                "`run` and `shell` default to local when omitted. `list` defaults to all executors when omitted. `scope=remote` requires a non-local executor.",
+                "`run` and `shell` default to local when omitted. `list` defaults to all tracked executors when omitted. `scope=remote` requires a non-local executor and performs a live untracked-task query.",
             ),
             prop(
                 "mode",
@@ -950,7 +931,7 @@ pub fn exbash() -> McpToolDef {
             prop(
                 "scope",
                 string_enum_default_desc(
-                    "Task tracking view for `list`, `run`, and `shell`. `local` tracks the current session; `workspace` tracks the current workdir; `remote` is only valid with `mode=list` and requires a non-local executor.",
+                    "Task tracking view for `list`, `run`, and `shell`. `local` tracks the current session; `workspace` tracks the current workdir; `remote` is only valid with `mode=list`, requires a non-local executor, and queries live remote tasks without changing stored tracking.",
                     &["local", "workspace", "remote"],
                     "local",
                 ),

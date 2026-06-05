@@ -122,7 +122,7 @@ fn tool_def(
 /// FileAction: patch, create, delete, or rename a file.
 ///
 /// Captured MCP input (create):
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
@@ -134,7 +134,10 @@ fn tool_def(
 ///       "includeStructuredContent": true,
 ///       "mode": "create",
 ///       "fileKey": "demo.rs",
-///       "content": "fn main() {\n    println!(\"hello\");\n}\n",
+///       "content": "fn main() {
+///     println!(\"hello\");
+/// }
+/// ",
 ///       "executor": "local"
 ///     }
 ///   }
@@ -142,7 +145,7 @@ fn tool_def(
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
@@ -150,7 +153,9 @@ fn tool_def(
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "Success. Created file:\nC demo.rs\n<fileRef>demo.rs #8EBE</fileRef>"
+///         "text": "Success. Created file:
+/// C demo.rs
+/// <fileRef>demo.rs #8EBE</fileRef>"
 ///       }
 ///     ]
 ///   }
@@ -158,7 +163,7 @@ fn tool_def(
 /// ```
 ///
 /// Captured MCP input (patch):
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 2,
@@ -170,7 +175,9 @@ fn tool_def(
 ///       "includeStructuredContent": true,
 ///       "mode": "patch",
 ///       "fileKey": "demo.rs #8EBE",
-///       "patchText": "insert -1\n+// patched\n",
+///       "patchText": "insert -1
+/// +// patched
+/// ",
 ///       "executor": "local"
 ///     }
 ///   }
@@ -178,7 +185,7 @@ fn tool_def(
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 2,
@@ -186,7 +193,9 @@ fn tool_def(
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "Success. Updated file:\nM demo.rs\n<fileRef>demo.rs #8EBE</fileRef>"
+///         "text": "Success. Updated file:
+/// M demo.rs
+/// <fileRef>demo.rs #8EBE</fileRef>"
 ///       }
 ///     ]
 ///   }
@@ -214,7 +223,7 @@ fn tool_def(
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 3,
@@ -222,7 +231,9 @@ fn tool_def(
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "Success. Renamed file:\nR demo.rs -> renamed.rs\n<fileRef>renamed.rs #8EBE</fileRef>"
+///         "text": "Success. Renamed file:
+/// R demo.rs -> renamed.rs
+/// <fileRef>renamed.rs #8EBE</fileRef>"
 ///       }
 ///     ]
 ///   }
@@ -249,7 +260,7 @@ fn tool_def(
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 4,
@@ -257,7 +268,8 @@ fn tool_def(
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "Success. Deleted file:\nD renamed.rs"
+///         "text": "Success. Deleted file:
+/// D renamed.rs"
 ///       }
 ///     ]
 ///   }
@@ -322,7 +334,7 @@ pub fn file_action() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
@@ -330,7 +342,11 @@ pub fn file_action() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "1: fn main() {\n2:     println!(\"hello\");\n3: }\n<fileRef>demo.rs #8EBE</fileRef>\ntotal 3 lines"
+///         "text": "1: fn main() {
+/// 2:     println!(\"hello\");
+/// 3: }
+/// <fileRef>demo.rs #8EBE</fileRef>
+/// total 3 lines"
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -371,7 +387,7 @@ pub fn file_action() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 2,
@@ -379,7 +395,9 @@ pub fn file_action() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "00000000  66 6E 20 6D 61 69 6E 28                          |fn main(|\n<fileRef>demo.rs #8EBE</fileRef>\nShowing bytes 0-7 of 37. Use offset=8 to continue."
+///         "text": "00000000  66 6E 20 6D 61 69 6E 28                          |fn main(|
+/// <fileRef>demo.rs #8EBE</fileRef>
+/// Showing bytes 0-7 of 37. Use offset=8 to continue."
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -444,7 +462,7 @@ pub fn read() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
@@ -452,7 +470,10 @@ pub fn read() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "/tmp/.tmp8V7Cxa/demo.rs:1:1:fn main() {\n\nmatches:1\ncode:0"
+///         "text": "/tmp/.tmp8V7Cxa/demo.rs:1:1:fn main() {
+///
+/// matches:1
+/// code:0"
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -486,7 +507,7 @@ pub fn read() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output (mode=files):
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
@@ -494,7 +515,10 @@ pub fn read() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "/tmp/.tmp8V7Cxa/demo.rs\n\nmatches:1\ncode:0"
+///         "text": "/tmp/.tmp8V7Cxa/demo.rs
+///
+/// matches:1
+/// code:0"
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -576,7 +600,7 @@ pub fn rg() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
@@ -584,12 +608,16 @@ pub fn rg() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "hello from exbash\r\n\ntotaloutput:19bytes\nexitcode:0"
+///         "text": "hello from exbash
+///
+/// totaloutput:19bytes
+/// exitcode:0"
 ///       }
 ///     ],
 ///     "structuredContent": {
 ///       "metadata": {
-///         "output": "hello from exbash\r\n",
+///         "output": "hello from exbash
+/// ",
 ///         "exitCode": 0
 ///       }
 ///     }
@@ -618,7 +646,7 @@ pub fn rg() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 2,
@@ -626,12 +654,16 @@ pub fn rg() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "shell-ok\r\n\ntotaloutput:10bytes\nexitcode:0"
+///         "text": "shell-ok
+///
+/// totaloutput:10bytes
+/// exitcode:0"
 ///       }
 ///     ],
 ///     "structuredContent": {
 ///       "metadata": {
-///         "output": "shell-ok\r\n",
+///         "output": "shell-ok
+/// ",
 ///         "exitCode": 0
 ///       }
 ///     }
@@ -660,7 +692,7 @@ pub fn rg() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 3,
@@ -668,7 +700,8 @@ pub fn rg() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "\nrex-1780576006395-3 detached"
+///         "text": "
+/// rex-1780576006395-3 detached"
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -719,7 +752,7 @@ pub fn rg() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 4,
@@ -727,7 +760,9 @@ pub fn rg() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "local:1 workspace:0\nshowing executor=local of local\n- local:rex-1780576006395-3 running totalOutput=0 command=sleep 5"
+///         "text": "local:1 workspace:0
+/// showing executor=local of local
+/// - local:rex-1780576006395-3 running totalOutput=0 command=sleep 5"
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -777,7 +812,7 @@ pub fn rg() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 5,
@@ -825,7 +860,7 @@ pub fn rg() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 6,
@@ -875,7 +910,7 @@ pub fn rg() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 7,
@@ -937,7 +972,7 @@ pub fn exbash() -> McpToolDef {
             prop("timeout", integer_prop("Total lifetime timeout in milliseconds. Omit, 0, or -1 to leave the run unmanaged.")),
             prop("read_timeout", integer_prop("How long to wait before returning. If the process is still running at timeout, the tool returns a detached snapshot with `asyncID`.")),
             prop("asyncID", string_prop("Run id returned by detached `run` or `attach`; required for `attach`, `list`, `stop`, and `remove`.")),
-            prop("text", string_prop("Text to write to PTY stdin in `attach` mode. Escape sequences such as `\\n` are interpreted.")),
+            prop("text", string_prop("Text to write to PTY stdin in `attach` mode. Common escape sequences are interpreted.")),
             prop("filePath", string_prop("File path for `attach` mode input. Mutually exclusive with `text`.")),
             prop("workdir", string_prop("Working directory for `run` and `shell` commands.")),
             prop("showRawPretty", boolean_prop("Include raw PTY text in attach metadata.")),
@@ -967,7 +1002,7 @@ pub fn exbash() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
@@ -975,7 +1010,9 @@ pub fn exbash() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "default executor: local\nexecutors:\n- local (default) system=linux device=maintainer url=ws://127.0.0.1:43555"
+///         "text": "default executor: local
+/// executors:
+/// - local (default) system=linux device=maintainer url=ws://127.0.0.1:43555"
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -1026,7 +1063,7 @@ pub fn exbash() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 2,
@@ -1034,7 +1071,10 @@ pub fn exbash() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "default executor: local\nexecutors:\n- local (default) system=linux device=maintainer url=ws://127.0.0.1:44881\n- loopback system=linux device=loopback url=ws://127.0.0.1:44881 labels=demo=true"
+///         "text": "default executor: local
+/// executors:
+/// - local (default) system=linux device=maintainer url=ws://127.0.0.1:44881
+/// - loopback system=linux device=loopback url=ws://127.0.0.1:44881 labels=demo=true"
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -1087,7 +1127,7 @@ pub fn exbash() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 3,
@@ -1095,7 +1135,14 @@ pub fn exbash() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "default:auto\ninteractive:auto\nsettingsPath:/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\nprofiles:\n- bash: candidates=.venv/bin/bash bash /bin/bash sh commandArgs=-lc {command} interactiveArgs=-l\n- node: candidates=node nodejs commandArgs=-e {command} interactiveArgs=<none>\n- powershell: candidates=pwsh powershell.exe commandArgs=-NoLogo -NoProfile -NonInteractive -Command {command} interactiveArgs=-NoLogo\n- python: candidates=.venv/bin/python .venv/Scripts/python.exe venv/bin/python venv/Scripts/python.exe python3 python commandArgs=-c {command} interactiveArgs=<none>"
+///         "text": "default:auto
+/// interactive:auto
+/// settingsPath:/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json
+/// profiles:
+/// - bash: candidates=.venv/bin/bash bash /bin/bash sh commandArgs=-lc {command} interactiveArgs=-l
+/// - node: candidates=node nodejs commandArgs=-e {command} interactiveArgs=<none>
+/// - powershell: candidates=pwsh powershell.exe commandArgs=-NoLogo -NoProfile -NonInteractive -Command {command} interactiveArgs=-NoLogo
+/// - python: candidates=.venv/bin/python .venv/Scripts/python.exe venv/bin/python venv/Scripts/python.exe python3 python commandArgs=-c {command} interactiveArgs=<none>"
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -1188,7 +1235,7 @@ pub fn exbash() -> McpToolDef {
 /// ```
 ///
 /// Captured MCP output:
-/// ```json
+/// ```text
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 4,
@@ -1196,7 +1243,9 @@ pub fn exbash() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "defaultShell:auto\nsettingsPath:/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\nresolution: requested=auto profile=bash program=bash args=-lc <empty> settingsPath=/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
+///         "text": "defaultShell:auto
+/// settingsPath:/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json
+/// resolution: requested=auto profile=bash program=bash args=-lc <empty> settingsPath=/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
 ///       }
 ///     ],
 ///     "structuredContent": {

@@ -1,1 +1,6 @@
 target/
+refs-opencode-napi/target/
+refs-opencode-napi/node_modules/
+refs-opencode-napi/index.js
+refs-opencode-napi/index.d.ts
+refs-opencode-napi/*.node

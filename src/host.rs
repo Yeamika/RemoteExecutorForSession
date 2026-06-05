@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::fmt::Display;
 
+pub const EXBASH_TASK_STACK_FULL_MESSAGE: &str = "Task stack is full. Please remove a task.";
+
 #[async_trait]
 pub trait SessionHost:
     SessionWorkdirProvider
@@ -77,6 +79,13 @@ pub struct ExbashSyncInput {
 pub trait ExbashSessionStore: Send + Sync {
     type Error: Send + Sync + Display + 'static;
 
+    async fn check_session_exbash_create(
+        &self,
+        _session_id: &str,
+        _input: &ExbashSyncInput,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
     async fn session_exbash_snapshot(
         &self,
         session_id: &str,
@@ -107,6 +116,14 @@ pub trait ExbashSessionStore: Send + Sync {
 pub trait ExbashWorkdirStore: Send + Sync {
     type Error: Send + Sync + Display + 'static;
 
+    async fn check_workdir_exbash_create(
+        &self,
+        _session_id: &str,
+        _workdir: &str,
+        _input: &ExbashSyncInput,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
     async fn workdir_exbash_snapshot(
         &self,
         session_id: &str,

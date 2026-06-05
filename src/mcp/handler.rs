@@ -428,6 +428,49 @@ impl<H: SessionHost> SessionMcpHandler<H> {
             })),
         })
     }
+
+    async fn check_exbash_create_allowed(
+        &self,
+        scope: &CallScope,
+        tracking_scope: &str,
+        arguments: &Value,
+    ) -> Result<(), JsonRpcError> {
+        let mode = optional_string_field(arguments, "mode").unwrap_or_else(|| "shell".to_string());
+        if !exbash_mode_creates_task(&mode) {
+            return Ok(());
+        }
+        let input = ExbashSyncInput {
+            async_id: optional_string_field(arguments, "asyncID"),
+            session_id: None,
+            workdir: optional_string_field(arguments, "workdir"),
+            executor: optional_string_field(arguments, "executor")
+                .or_else(|| optional_string_field(arguments, "targetExecutor")),
+            state: None,
+            pid: None,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+            command: optional_string_field(arguments, "command"),
+            description: optional_string_field(arguments, "description"),
+            total_output: None,
+        };
+        if tracking_scope == "workspace" {
+            let input = ExbashSyncInput {
+                session_id: Some(scope.session_id.clone()),
+                workdir: Some(scope.workdir.clone()),
+                ..input
+            };
+            return self
+                .host
+                .check_workdir_exbash_create(&scope.session_id, &scope.workdir, &input)
+                .await
+                .map_err(|err| JsonRpcError::invalid_params(err.to_string()));
+        }
+        self.host
+            .check_session_exbash_create(&scope.session_id, &input)
+            .await
+            .map_err(|err| JsonRpcError::invalid_params(err.to_string()))
+    }
 }
 
 fn extract_executor(arguments: &mut Value) -> String {
@@ -473,6 +516,10 @@ fn extract_exbash_scope(arguments: &Value) -> Result<String, JsonRpcError> {
             "invalid exbash scope: {other}; expected local, workspace, or remote"
         ))),
     }
+}
+
+fn exbash_mode_creates_task(mode: &str) -> bool {
+    matches!(mode, "run" | "shell")
 }
 
 fn extract_rg_mode(arguments: &Value) -> Result<RgMode, JsonRpcError> {
@@ -777,6 +824,8 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                         object.insert("mode".to_string(), Value::String(mode.clone()));
                     }
                 }
+                self.check_exbash_create_allowed(&scope, &tracking_scope, &call_args)
+                    .await?;
                 remove_field(&mut call_args, "scope");
                 remove_field(&mut call_args, "spoe");
                 let result = self.call_via_manager(&scope, "exbash", call_args).await?;

@@ -4,6 +4,9 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use crate::demos::memory_host::MemorySessionHost;
+use crate::host::{
+    ExbashSessionStore, ExbashSyncInput, ExbashWorkdirStore, EXBASH_TASK_STACK_FULL_MESSAGE,
+};
 use crate::jsonrpc::{JsonRpcEndpoint, JsonRpcHandler};
 use crate::mcp::{create_session_mcp_with_manager, EXECUTOR_SESSION_PARAM};
 use crate::rec::{new_manager, ShellManager, ToolContext};
@@ -78,6 +81,19 @@ fn is_transient_error(r: &Value) -> bool {
     msg.contains("PTY")
         || msg.contains("ShellManager")
         || msg.contains("another write operation is already running")
+}
+
+fn exbash_limit_task(id: usize) -> ExbashSyncInput {
+    ExbashSyncInput {
+        async_id: Some(format!("full-{id}")),
+        executor: Some("local".to_string()),
+        state: Some("stopped".to_string()),
+        started_at: Some(id as i64),
+        ended_at: Some(id as i64 + 1),
+        command: Some(format!("echo {id}")),
+        description: Some(format!("task {id}")),
+        ..ExbashSyncInput::default()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -613,6 +629,93 @@ async fn exbash_workdir_tracks_specified_directory() {
         "exbash workdir test passed: session_dir={}, workdir={}",
         session_path, workdir_path
     );
+}
+
+#[tokio::test]
+async fn exbash_session_stack_full_rejects_new_run_before_spawn() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(
+        MemorySessionHost::new("ses_session_limit", dir.path().to_string_lossy())
+            .with_exbash_task_limit(10),
+    );
+    for id in 0..10 {
+        host.upsert_session_exbash("ses_session_limit", exbash_limit_task(id))
+            .await
+            .unwrap();
+    }
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let blocked = call(
+        &ep,
+        "ses_session_limit",
+        "exbash",
+        json!({"mode":"run","command":"echo blocked","read_timeout":5000}),
+    )
+    .await;
+    assert_eq!(blocked["error"]["code"], -32602);
+    assert_eq!(
+        blocked["error"]["message"].as_str().unwrap_or(""),
+        EXBASH_TASK_STACK_FULL_MESSAGE
+    );
+
+    let list = call(&ep, "ses_session_limit", "exbash", json!({"mode":"list"})).await;
+    assert!(list["error"].is_null(), "list failed: {:?}", list["error"]);
+}
+
+#[tokio::test]
+async fn exbash_workspace_stack_full_rejects_new_run_before_spawn() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(
+        MemorySessionHost::new("ses_workspace_limit", dir.path().to_string_lossy())
+            .with_exbash_task_limit(10),
+    );
+    let workdir = dir.path().to_string_lossy();
+    for id in 0..10 {
+        host.upsert_workdir_exbash("ses_workspace_limit", &workdir, exbash_limit_task(id))
+            .await
+            .unwrap();
+    }
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let blocked = call(
+        &ep,
+        "ses_workspace_limit",
+        "exbash",
+        json!({"mode":"run","scope":"workspace","command":"echo blocked","read_timeout":5000}),
+    )
+    .await;
+    assert_eq!(blocked["error"]["code"], -32602);
+    assert_eq!(
+        blocked["error"]["message"].as_str().unwrap_or(""),
+        EXBASH_TASK_STACK_FULL_MESSAGE
+    );
+
+    let list = call(
+        &ep,
+        "ses_workspace_limit",
+        "exbash",
+        json!({"mode":"list","scope":"workspace"}),
+    )
+    .await;
+    assert!(list["error"].is_null(), "list failed: {:?}", list["error"]);
 }
 
 #[tokio::test]

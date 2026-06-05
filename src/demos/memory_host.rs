@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::host::{
     ExbashSessionStore, ExbashSyncInput, ExbashWorkdirStore, HashRefSessionStore,
-    RemoteExecutorConfigStore, SessionWorkdirProvider,
+    RemoteExecutorConfigStore, SessionWorkdirProvider, EXBASH_TASK_STACK_FULL_MESSAGE,
 };
 use crate::refs::{basename, make_entry_parts, parse_hash_ref, small_hash_code};
 use crate::types::{ExbashTaskSnapshot, FileRefEntry, FileRefUpdate, RemoteExecutorConfigSnapshot};
@@ -22,6 +22,7 @@ pub struct MemorySessionHost {
     session_tasks: Arc<RwLock<HashMap<Key, ExbashTaskSnapshot>>>,
     workdir_tasks: Arc<RwLock<HashMap<Key, ExbashTaskSnapshot>>>,
     configs: Arc<RwLock<HashMap<String, Value>>>,
+    exbash_task_limit: Option<usize>,
 }
 
 impl MemorySessionHost {
@@ -38,7 +39,13 @@ impl MemorySessionHost {
             session_tasks: Arc::new(RwLock::new(HashMap::new())),
             workdir_tasks: Arc::new(RwLock::new(HashMap::new())),
             configs: Arc::new(RwLock::new(HashMap::new())),
+            exbash_task_limit: None,
         }
+    }
+
+    pub fn with_exbash_task_limit(mut self, limit: usize) -> Self {
+        self.exbash_task_limit = Some(limit);
+        self
     }
 
     fn scoped_key(session_id: &str, key: impl AsRef<str>) -> String {
@@ -137,6 +144,39 @@ impl HashRefSessionStore for MemorySessionHost {
 impl ExbashSessionStore for MemorySessionHost {
     type Error = String;
 
+    async fn check_session_exbash_create(
+        &self,
+        session_id: &str,
+        input: &ExbashSyncInput,
+    ) -> Result<(), Self::Error> {
+        let Some(limit) = self.exbash_task_limit else {
+            return Ok(());
+        };
+        let executor = input.executor.as_deref().unwrap_or("local");
+        if let Some(async_id) = input.async_id.as_deref().filter(|value| !value.is_empty()) {
+            if self
+                .session_tasks
+                .read()
+                .await
+                .contains_key(&format!("{session_id}:{async_id}:{executor}"))
+            {
+                return Ok(());
+            }
+        }
+        let prefix = format!("{session_id}:");
+        let count = self
+            .session_tasks
+            .read()
+            .await
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .count();
+        if count >= limit {
+            return Err(EXBASH_TASK_STACK_FULL_MESSAGE.to_string());
+        }
+        Ok(())
+    }
+
     async fn session_exbash_snapshot(
         &self,
         session_id: &str,
@@ -221,6 +261,40 @@ impl ExbashSessionStore for MemorySessionHost {
 #[async_trait]
 impl ExbashWorkdirStore for MemorySessionHost {
     type Error = String;
+
+    async fn check_workdir_exbash_create(
+        &self,
+        _session_id: &str,
+        workdir: &str,
+        input: &ExbashSyncInput,
+    ) -> Result<(), Self::Error> {
+        let Some(limit) = self.exbash_task_limit else {
+            return Ok(());
+        };
+        let executor = input.executor.as_deref().unwrap_or("local");
+        if let Some(async_id) = input.async_id.as_deref().filter(|value| !value.is_empty()) {
+            if self
+                .workdir_tasks
+                .read()
+                .await
+                .contains_key(&format!("{workdir}:{executor}:{async_id}"))
+            {
+                return Ok(());
+            }
+        }
+        let prefix = format!("{workdir}:");
+        let count = self
+            .workdir_tasks
+            .read()
+            .await
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .count();
+        if count >= limit {
+            return Err(EXBASH_TASK_STACK_FULL_MESSAGE.to_string());
+        }
+        Ok(())
+    }
 
     async fn workdir_exbash_snapshot(
         &self,

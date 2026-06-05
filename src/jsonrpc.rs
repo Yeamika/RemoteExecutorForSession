@@ -42,11 +42,27 @@ pub struct JsonRpcError {
 
 impl JsonRpcError {
     pub fn method_not_found(method: &str) -> Self {
-        Self { code: -32601, message: format!("method not found: {method}"), data: None }
+        Self {
+            code: -32601,
+            message: format!("method not found: {method}"),
+            data: None,
+        }
+    }
+
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+            data: None,
+        }
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
-        Self { code: -32603, message: message.into(), data: None }
+        Self {
+            code: -32603,
+            message: message.into(),
+            data: None,
+        }
     }
 }
 
@@ -62,7 +78,9 @@ pub struct JsonRpcEndpoint<H: JsonRpcHandler> {
 
 impl<H: JsonRpcHandler> JsonRpcEndpoint<H> {
     pub fn new(handler: H) -> Self {
-        Self { handler: Arc::new(handler) }
+        Self {
+            handler: Arc::new(handler),
+        }
     }
 
     pub async fn handle_value(&self, input: Value) -> Value {
@@ -96,8 +114,18 @@ impl<H: JsonRpcHandler> JsonRpcEndpoint<H> {
 }
 
 fn error_response(id: Value, code: i64, message: impl Into<String>, data: Option<Value>) -> Value {
-    let error = JsonRpcErrorObject { code, message: message.into(), data };
-    serde_json::to_value(JsonRpcResponse { jsonrpc: version(), id, result: None, error: Some(error) }).unwrap()
+    let error = JsonRpcErrorObject {
+        code,
+        message: message.into(),
+        data,
+    };
+    serde_json::to_value(JsonRpcResponse {
+        jsonrpc: version(),
+        id,
+        result: None,
+        error: Some(error),
+    })
+    .unwrap()
 }
 
 fn version() -> String {
@@ -114,17 +142,23 @@ mod tests {
     #[async_trait]
     impl JsonRpcHandler for Echo {
         async fn call(&self, method: &str, params: Value) -> Result<Value, JsonRpcError> {
-            if method == "echo" { Ok(params) } else { Err(JsonRpcError::method_not_found(method)) }
+            if method == "echo" {
+                Ok(params)
+            } else {
+                Err(JsonRpcError::method_not_found(method))
+            }
         }
     }
 
     #[tokio::test]
     async fn handles_batch() {
         let endpoint = JsonRpcEndpoint::new(Echo);
-        let result = endpoint.handle_value(json!([
-            { "jsonrpc": "2.0", "id": 1, "method": "echo", "params": { "a": 1 } },
-            { "jsonrpc": "2.0", "id": 2, "method": "missing", "params": {} }
-        ])).await;
+        let result = endpoint
+            .handle_value(json!([
+                { "jsonrpc": "2.0", "id": 1, "method": "echo", "params": { "a": 1 } },
+                { "jsonrpc": "2.0", "id": 2, "method": "missing", "params": {} }
+            ]))
+            .await;
         assert_eq!(result[0]["result"]["a"], 1);
         assert_eq!(result[1]["error"]["code"], -32601);
     }

@@ -38,8 +38,8 @@ fn boolean_default(description: &str, default: bool) -> Value {
     json!({ "type": "boolean", "description": description, "default": default })
 }
 
-fn array_prop(item_type: &str) -> Value {
-    json!({ "type": "array", "items": { "type": item_type } })
+fn array_string_desc(description: &str) -> Value {
+    json!({ "type": "array", "description": description, "items": { "type": "string" } })
 }
 
 fn object_prop(additional: &str) -> Value {
@@ -49,7 +49,7 @@ fn object_prop(additional: &str) -> Value {
 fn exec_session_prop() -> (String, Value) {
     prop(
         EXECUTOR_SESSION_PARAM,
-        string_prop("OpenCode executor/session routing id"),
+        string_prop("Session id; filled by the host system."),
     )
 }
 
@@ -57,15 +57,37 @@ fn executor_prop() -> (String, Value) {
     prop("executor", string_default("Target executor id", "local"))
 }
 
+fn executor_empty_default_prop(description: &str) -> (String, Value) {
+    prop("executor", string_default(description, ""))
+}
+
 fn tool_def(
     name: &str,
     description: &str,
-    required: Vec<&str>,
+    mut required: Vec<&str>,
     properties: Vec<(String, Value)>,
 ) -> McpToolDef {
+    let mut has_executor_session = false;
     let mut props = Map::new();
     for (k, v) in properties {
+        if k == EXECUTOR_SESSION_PARAM {
+            has_executor_session = true;
+            continue;
+        }
         props.insert(k, v);
+    }
+    if has_executor_session {
+        let mut ordered = Map::new();
+        ordered.insert(
+            EXECUTOR_SESSION_PARAM.to_string(),
+            string_prop("Session id; filled by the host system."),
+        );
+        for (k, v) in props {
+            ordered.insert(k, v);
+        }
+        props = ordered;
+        required.retain(|item| *item != EXECUTOR_SESSION_PARAM);
+        required.insert(0, EXECUTOR_SESSION_PARAM);
     }
     let schema = json!({
         "type": "object",
@@ -81,26 +103,141 @@ fn tool_def(
 
 /// FileAction: patch, create, delete, or rename a file.
 ///
-/// Real MCP JSON-RPC response (create):
+/// Captured MCP input (create):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 1,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "FileAction",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "create",
+///       "fileKey": "demo.rs",
+///       "content": "fn main() {\n    println!(\"hello\");\n}\n",
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
 /// ```json
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
 ///   "result": {
-///     "content": [{ "type": "text", "text": "Success. Created file:\nC demo.rs" }],
-///     "structuredContent": {
-///       "metadata": {
-///         "diagnostics": {},
-///         "file": {
-///           "additions": 37,
-///           "deletions": 0,
-///           "filePath": "/tmp/.tmpXXX/demo.rs",
-///           "relativePath": "demo.rs",
-///           "type": "create"
-///         }
-///       },
-///       "output": { "message": "", "text": "Success. Created file:\nC demo.rs", "info": "" }
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "Success. Created file:\nC demo.rs\n<fileRef>demo.rs #8EBE</fileRef>"
+///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (patch):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 2,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "FileAction",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "patch",
+///       "fileKey": "demo.rs #8EBE",
+///       "patchText": "insert -1\n+// patched\n",
+///       "executor": "local"
 ///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 2,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "Success. Updated file:\nM demo.rs\n<fileRef>demo.rs #8EBE</fileRef>"
+///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (rename):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 3,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "FileAction",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "rename",
+///       "fileKey": "demo.rs #8EBE",
+///       "newFilePath": "/tmp/refs-mcp-examples-vtOsrZ/renamed.rs",
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 3,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "Success. Renamed file:\nR demo.rs -> renamed.rs\n<fileRef>renamed.rs #8EBE</fileRef>"
+///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (delete):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 4,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "FileAction",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "delete",
+///       "fileKey": "renamed.rs #8EBE",
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 4,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "Success. Deleted file:\nD renamed.rs"
+///       }
+///     ]
 ///   }
 /// }
 /// ```
@@ -141,24 +278,97 @@ pub fn file_action() -> McpToolDef {
 
 /// Read a file via REC. Supports file references ("filename #ABCD") and direct paths.
 ///
-/// Real MCP JSON-RPC response:
+/// Captured MCP input (mode=text):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 1,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "read",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "fileKey": "demo.rs",
+///       "mode": "text",
+///       "limit": 3,
+///       "hashCheckMode": true,
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
 /// ```json
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
 ///   "result": {
-///     "content": [{ "type": "text", "text": "1: fn main() {\n2:     println!(\"hello\");\n3: }\ntotal 3 lines" }],
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "1: fn main() {\n2:     println!(\"hello\");\n3: }\n<fileRef>demo.rs #8EBE</fileRef>\ntotal 3 lines"
+///       }
+///     ],
 ///     "structuredContent": {
 ///       "metadata": {
 ///         "file": {
-///           "canonicalPath": "/tmp/.tmpXXX/demo.rs",
-///           "fileKey": "file-id:Inode { device_id: 138, inode_number: 413089 }",
+///           "fileKey": "file-id:Inode { device_id: 138, inode_number: 419297 }",
+///           "canonicalPath": "/tmp/.tmp8V7Cxa/demo.rs",
 ///           "kind": "file",
-///           "mtimeMs": 1780511126227,
-///           "size": 37
-///         }
-///       },
-///       "output": { "message": "", "text": "1: fn main() {\n2:     println!(\"hello\");\n3: }", "info": "total 3 lines" }
+///           "size": 37,
+///           "mtimeMs": 1780575799221
+///         },
+///         "hashCode": "sha256:35e0393811f794547c34763eb5773d6cddb295dc4f372180ed4aae67da3ea45f"
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=binary):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 2,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "read",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "fileKey": "demo.rs #8EBE",
+///       "mode": "binary",
+///       "offset": 0,
+///       "limit": 8,
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 2,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "00000000  66 6E 20 6D 61 69 6E 28                          |fn main(|\n<fileRef>demo.rs #8EBE</fileRef>\nShowing bytes 0-7 of 37. Use offset=8 to continue."
+///       }
+///     ],
+///     "structuredContent": {
+///       "metadata": {
+///         "file": {
+///           "fileKey": "file-id:Inode { device_id: 138, inode_number: 419297 }",
+///           "canonicalPath": "/tmp/refs-mcp-examples-vtOsrZ/demo.rs",
+///           "kind": "file",
+///           "size": 37,
+///           "mtimeMs": 1780576006283
+///         },
+///         "hashCode": "sha256:35e0393811f794547c34763eb5773d6cddb295dc4f372180ed4aae67da3ea45f"
+///       }
 ///     }
 ///   }
 /// }
@@ -188,21 +398,87 @@ pub fn read() -> McpToolDef {
     )
 }
 
-/// REC ripgrep-like search. Returns matching lines with file/line/column metadata.
+/// REC ripgrep-like search. mode=content searches file contents; mode=files matches file paths by glob pattern.
 ///
-/// Real MCP JSON-RPC response:
+/// Captured MCP input (mode=content):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 1,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "rg",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "pattern": "fn",
+///       "path": "/tmp/.tmp8V7Cxa",
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
 /// ```json
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
 ///   "result": {
-///     "content": [{ "type": "text", "text": "/tmp/.tmpXXX/demo.rs:1:1:fn main() {\n" }],
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "/tmp/.tmp8V7Cxa/demo.rs:1:1:fn main() {\n\nmatches:1\ncode:0"
+///       }
+///     ],
 ///     "structuredContent": {
 ///       "metadata": {
-///         "code": 0,
-///         "matches": 1
-///       },
-///       "output": { "message": "", "text": "/tmp/.tmpXXX/demo.rs:1:1:fn main() {\n", "info": "" }
+///         "matches": 1,
+///         "code": 0
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=files):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 1,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "rg",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "files",
+///       "pattern": "*.rs",
+///       "path": "/tmp/.tmp8V7Cxa",
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output (mode=files):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 1,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "/tmp/.tmp8V7Cxa/demo.rs\n\nmatches:1\ncode:0"
+///       }
+///     ],
+///     "structuredContent": {
+///       "metadata": {
+///         "count": 1,
+///         "truncated": false,
+///         "mode": "files",
+///         "matches": 1,
+///         "code": 0
+///       }
 ///     }
 ///   }
 /// }
@@ -210,21 +486,42 @@ pub fn read() -> McpToolDef {
 pub fn rg() -> McpToolDef {
     tool_def(
         "rg",
-        "REC ripgrep-like search. Returns matching lines with file/line/column metadata. Search results are paths, not hashRefs; call `read` on a path first when a later edit should use a stale-safe `fileKey`.",
+        "REC rg search. mode=content searches file contents and returns matching lines. mode=files matches file paths by glob pattern and returns paths. Search results are paths, not hashRefs; call `read` on a path first when a later edit should use a stale-safe `fileKey`.",
         vec!["pattern"],
         vec![
             exec_session_prop(),
             executor_prop(),
-            prop("pattern", string_prop("Regex pattern to search for")),
+            prop(
+                "mode",
+                string_enum_default_desc(
+                    "content: search file contents. files: match file paths by glob pattern.",
+                    &["content", "files"],
+                    "content",
+                ),
+            ),
+            prop(
+                "type",
+                string_enum_default_desc(
+                    "Alias for mode; prefer mode.",
+                    &["content", "files"],
+                    "content",
+                ),
+            ),
+            prop(
+                "pattern",
+                string_prop(
+                    "content mode: regex pattern to search for. files mode: glob pattern such as `*.rs` or `src/**/*.ts`.",
+                ),
+            ),
             prop("path", string_prop("Specific file or directory to search")),
-            prop("globs", array_prop("string")),
+            prop("globs", array_string_desc("Content mode file glob filters")),
             prop(
                 "case_sensitive",
-                boolean_default("Case-sensitive matching", true),
+                boolean_default("Content mode case-sensitive matching", true),
             ),
             prop(
                 "max_count",
-                integer_prop("Maximum number of matches to return"),
+                integer_prop("Content mode maximum number of matches to return"),
             ),
         ],
     )
@@ -232,19 +529,334 @@ pub fn rg() -> McpToolDef {
 
 /// REC exbash PTY tool. Run shell commands, attach to running sessions, list/stop/remove tasks.
 ///
-/// Real MCP JSON-RPC response (run, command completes immediately):
+/// Captured MCP input (run, command completes immediately):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 1,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "run",
+///       "command": "echo hello from exbash",
+///       "read_timeout": 5000,
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
 /// ```json
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
 ///   "result": {
-///     "content": [{ "type": "text", "text": "hello from exbash\r\n" }],
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "hello from exbash\r\n\ntotaloutput:19bytes\nexitcode:0"
+///       }
+///     ],
 ///     "structuredContent": {
 ///       "metadata": {
-///         "exitCode": 0,
-///         "output": "hello from exbash\r\n"
-///       },
-///       "output": { "message": "", "text": "hello from exbash\r\n", "info": "" }
+///         "output": "hello from exbash\r\n",
+///         "exitCode": 0
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=shell):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 2,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "shell",
+///       "command": "echo shell-ok",
+///       "read_timeout": 5000,
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 2,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "shell-ok\r\n\ntotaloutput:10bytes\nexitcode:0"
+///       }
+///     ],
+///     "structuredContent": {
+///       "metadata": {
+///         "output": "shell-ok\r\n",
+///         "exitCode": 0
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=run, detached):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 3,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "run",
+///       "command": "sleep 5",
+///       "read_timeout": 10,
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 3,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "\nrex-1780576006395-3 detached"
+///       }
+///     ],
+///     "structuredContent": {
+///       "metadata": {
+///         "asyncID": "rex-1780576006395-3",
+///         "pid": 72504,
+///         "state": "running",
+///         "totalOutput": 0,
+///         "command": "sleep 5",
+///         "description": "sleep 5",
+///         "cwd": "/tmp/refs-mcp-examples-vtOsrZ",
+///         "timeout": null,
+///         "startedAt": 1780576006396,
+///         "detached": true,
+///         "hostSnapshot": {
+///           "asyncId": "rex-1780576006395-3",
+///           "executor": "local",
+///           "sessionId": "codex-mcp-test",
+///           "state": "running",
+///           "pid": 72504,
+///           "startedAt": 1780576006396,
+///           "command": "sleep 5",
+///           "description": "sleep 5",
+///           "totalOutput": 0
+///         }
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=list):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 4,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "list",
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 4,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "local:1 workspace:0\nshowing executor=local of local\n- local:rex-1780576006395-3 running totalOutput=0 command=sleep 5"
+///       }
+///     ],
+///     "structuredContent": {
+///       "metadata": {
+///         "scope": "local",
+///         "executor": "local",
+///         "localCount": 1,
+///         "workspaceCount": 0,
+///         "remoteUntrackedCount": null,
+///         "tasks": [
+///           {
+///             "asyncId": "rex-1780576006395-3",
+///             "executor": "local",
+///             "sessionId": "codex-mcp-test",
+///             "state": "running",
+///             "pid": 72504,
+///             "startedAt": 1780576006396,
+///             "command": "sleep 5",
+///             "description": "sleep 5",
+///             "totalOutput": 0
+///           }
+///         ]
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=attach):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 5,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "attach",
+///       "asyncID": "rex-1780576006395-3",
+///       "read_timeout": 0,
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 5,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": ""
+///       }
+///     ],
+///     "structuredContent": {
+///       "metadata": {
+///         "asyncID": "rex-1780576006395-3",
+///         "wrote": 0,
+///         "source": "attach",
+///         "outputBytes": 0,
+///         "hostSnapshot": {
+///           "asyncId": "rex-1780576006395-3",
+///           "executor": "local",
+///           "sessionId": "codex-mcp-test"
+///         }
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=stop):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 6,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "stop",
+///       "asyncID": "rex-1780576006395-3",
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 6,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": ""
+///       }
+///     ],
+///     "structuredContent": {
+///       "metadata": {
+///         "asyncID": "rex-1780576006395-3",
+///         "pid": 72504,
+///         "state": "stopped",
+///         "exitCode": "stopped",
+///         "totalOutput": 0,
+///         "command": "sleep 5",
+///         "description": "sleep 5",
+///         "cwd": "/tmp/refs-mcp-examples-vtOsrZ",
+///         "timeout": null,
+///         "startedAt": 1780576006396,
+///         "endedAt": 1780576006461
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=remove):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 7,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "remove",
+///       "asyncID": "rex-1780576006395-3",
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 7,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "ok"
+///       }
+///     ],
+///     "structuredContent": {
+///       "metadata": {
+///         "ok": true
+///       }
 ///     }
 ///   }
 /// }
@@ -256,13 +868,23 @@ pub fn exbash() -> McpToolDef {
         vec![],
         vec![
             exec_session_prop(),
-            executor_prop(),
+            executor_empty_default_prop(
+                "`run` and `shell` default to local when omitted. `list` defaults to all executors when omitted. `scope=remote` requires a non-local executor.",
+            ),
             prop(
                 "mode",
                 string_enum_default_desc(
                     "Operation selector. `shell` is the default terminal path. `run` directly starts a program and splits `command` into executable + argv without shell parsing.",
                     &["run", "shell", "attach", "list", "stop", "remove"],
                     "shell",
+                ),
+            ),
+            prop(
+                "scope",
+                string_enum_default_desc(
+                    "Task tracking view for `list`, `run`, and `shell`. `local` tracks the current session; `workspace` tracks the current workdir; `remote` is only valid with `mode=list` and requires a non-local executor.",
+                    &["local", "workspace", "remote"],
+                    "local",
                 ),
             ),
             prop(
@@ -292,15 +914,37 @@ pub fn exbash() -> McpToolDef {
 
 /// Manage RemoteExecutor: list/connect executors, set default, list shell profiles.
 ///
-/// Real MCP JSON-RPC response (list_executor):
+/// Captured MCP input (list_executor):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 1,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "RemoteExecutorManager",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "method": "list_executor",
+///       "id": "0",
+///       "executor": "local"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
 /// ```json
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 1,
 ///   "result": {
-///     "content": [{ "type": "text", "text": "{\n  \"executor\": \"caller\",\n  \"id\": 1,\n  \"ok\": true,\n  \"result\": {\n    \"metadata\": {\n      \"default\": \"local\",\n      \"executors\": [\n        {\n          \"device\": \"maintainer\",\n          \"id\": \"local\",\n          \"labels\": {},\n          \"system\": \"linux\",\n          \"url\": \"ws://127.0.0.1:43495\"\n        }\n      ]\n    }\n  }\n}" }],
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "default executor: local\nexecutors:\n- local (default) system=linux device=maintainer url=ws://127.0.0.1:43555"
+///       }
+///     ],
 ///     "structuredContent": {
-///       "executor": "caller",
 ///       "id": 1,
 ///       "ok": true,
 ///       "result": {
@@ -308,15 +952,191 @@ pub fn exbash() -> McpToolDef {
 ///           "default": "local",
 ///           "executors": [
 ///             {
-///               "device": "maintainer",
 ///               "id": "local",
-///               "labels": {},
 ///               "system": "linux",
-///               "url": "ws://127.0.0.1:43495"
+///               "device": "maintainer",
+///               "labels": {},
+///               "url": "ws://127.0.0.1:43555"
 ///             }
 ///           ]
 ///         }
+///       },
+///       "executor": "caller"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (connect_to_executor):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 2,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "RemoteExecutorManager",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "method": "connect_to_executor",
+///       "id": "loopback",
+///       "url": "ws://127.0.0.1:44881",
+///       "system": "linux",
+///       "device": "loopback",
+///       "labels": {
+///         "demo": "true"
 ///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 2,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "default executor: local\nexecutors:\n- local (default) system=linux device=maintainer url=ws://127.0.0.1:44881\n- loopback system=linux device=loopback url=ws://127.0.0.1:44881 labels=demo=true"
+///       }
+///     ],
+///     "structuredContent": {
+///       "id": 1,
+///       "ok": true,
+///       "result": {
+///         "metadata": {
+///           "default": "local",
+///           "executors": [
+///             {
+///               "id": "local",
+///               "system": "linux",
+///               "device": "maintainer",
+///               "labels": {},
+///               "url": "ws://127.0.0.1:44881"
+///             },
+///             {
+///               "id": "loopback",
+///               "system": "linux",
+///               "device": "loopback",
+///               "labels": {
+///                 "demo": "true"
+///               },
+///               "url": "ws://127.0.0.1:44881"
+///             }
+///           ]
+///         }
+///       },
+///       "executor": "caller"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (list_shells):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 3,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "RemoteExecutorManager",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "method": "list_shells"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 3,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "{\n  \"default\": \"auto\",\n  \"interactive\": \"auto\",\n  \"profiles\": {\n    \"bash\": {\n      \"candidates\": [\n        \"bash\"\n      ],\n      \"commandArgs\": [\n        \"-lc\",\n        \"{command}\"\n      ],\n      \"interactiveArgs\": [\n        \"-i\"\n      ]\n    }\n  },\n  \"settingsPath\": \"/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\"\n}"
+///       }
+///     ],
+///     "structuredContent": {
+///       "metadata": {
+///         "default": "auto",
+///         "interactive": "auto",
+///         "profiles": {
+///           "bash": {
+///             "candidates": [
+///               "bash"
+///             ],
+///             "commandArgs": [
+///               "-lc",
+///               "{command}"
+///             ],
+///             "interactiveArgs": [
+///               "-i"
+///             ]
+///           }
+///         },
+///         "settingsPath": "/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
+///       }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (set_executor_shell):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 4,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "RemoteExecutorManager",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "method": "set_executor_shell",
+///       "executor": "local",
+///       "shell": "auto"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 4,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "{\n  \"defaultShell\": \"auto\",\n  \"resolution\": {\n    \"requested\": \"auto\",\n    \"profile\": \"bash\",\n    \"program\": \"bash\",\n    \"args\": [\n      \"-lc\",\n      \"\"\n    ],\n    \"settingsPath\": \"/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\"\n  },\n  \"settingsPath\": \"/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\"\n}"
+///       }
+///     ],
+///     "structuredContent": {
+///       "id": 1,
+///       "ok": true,
+///       "result": {
+///         "metadata": {
+///           "defaultShell": "auto",
+///           "resolution": {
+///             "requested": "auto",
+///             "profile": "bash",
+///             "program": "bash",
+///             "args": [
+///               "-lc",
+///               ""
+///             ],
+///             "settingsPath": "/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
+///           },
+///           "settingsPath": "/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
+///         }
+///       },
+///       "executor": "local"
 ///     }
 ///   }
 /// }
@@ -328,6 +1148,7 @@ pub fn remote_executor_manager() -> McpToolDef {
         vec!["method"],
         vec![
             exec_session_prop(),
+            executor_prop(),
             prop(
                 "method",
                 string_enum_prop(&[

@@ -579,18 +579,12 @@ pub fn rg() -> McpToolDef {
 
 /// REC exbash PTY tool. Run shell commands, attach to running sessions, list/stop/remove tasks.
 ///
-/// Task states shown in tracked lists use these protocol values:
-/// `running`, `exit:<code>`, `timeout`, and `stop`. `unknown` is only a display
-/// fallback for abnormal persisted state; REFS does not actively write it.
-///
-/// Remote executor state is lazy-tracked. Stored local/workspace entries for a
-/// remote executor keep their previous state until a real executor call succeeds.
-/// Successful `attach`, `stop`, or `remove` calls update/clear matching tracked
-/// entries. Failed remote calls leave tracked state unchanged. Use
+/// Remote executor tracking is lazy: stored state is updated only after a
+/// successful executor call; failed remote calls leave stored state unchanged. Use
 /// `scope=remote` with a non-local `executor` to query live untracked remote
 /// tasks without changing stored tracking.
 ///
-/// Captured MCP input (run, command completes immediately):
+/// Captured MCP input (mode=run, command completes immediately):
 /// ```json
 /// {
 ///   "jsonrpc": "2.0",
@@ -601,9 +595,8 @@ pub fn rg() -> McpToolDef {
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
 ///       "mode": "run",
-///       "command": "echo hello from exbash",
-///       "read_timeout": 5000,
-///       "executor": "local"
+///       "command": "printf run-ok",
+///       "read_timeout": 5000
 ///     }
 ///   }
 /// }
@@ -618,9 +611,9 @@ pub fn rg() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "hello from exbash
+///         "text": "run-ok
 ///
-/// totaloutput:19bytes
+/// totaloutput:6bytes
 /// exitcode:0"
 ///       }
 ///     ]
@@ -628,7 +621,7 @@ pub fn rg() -> McpToolDef {
 /// }
 /// ```
 ///
-/// Captured MCP input (mode=shell):
+/// Captured MCP input (mode=shell, command completes with non-zero exit):
 /// ```json
 /// {
 ///   "jsonrpc": "2.0",
@@ -639,9 +632,8 @@ pub fn rg() -> McpToolDef {
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
 ///       "mode": "shell",
-///       "command": "echo shell-ok",
-///       "read_timeout": 5000,
-///       "executor": "local"
+///       "command": "printf shell-ok; exit 3",
+///       "read_timeout": 5000
 ///     }
 ///   }
 /// }
@@ -658,8 +650,8 @@ pub fn rg() -> McpToolDef {
 ///         "type": "text",
 ///         "text": "shell-ok
 ///
-/// totaloutput:10bytes
-/// exitcode:0"
+/// totaloutput:8bytes
+/// exitcode:3"
 ///       }
 ///     ]
 ///   }
@@ -678,8 +670,7 @@ pub fn rg() -> McpToolDef {
 ///       "ExecutorSessionID": "codex-mcp-test",
 ///       "mode": "run",
 ///       "command": "sleep 5",
-///       "read_timeout": 10,
-///       "executor": "local"
+///       "read_timeout": 10
 ///     }
 ///   }
 /// }
@@ -695,18 +686,187 @@ pub fn rg() -> McpToolDef {
 ///       {
 ///         "type": "text",
 ///         "text": "
-/// rex-1780576006395-3 detached"
+/// rex-1780668734598-3 detached"
 ///       }
 ///     ]
 ///   }
 /// }
 /// ```
 ///
-/// Captured MCP input (mode=list):
+/// Captured MCP input (mode=attach, running task with no new output):
 /// ```json
 /// {
 ///   "jsonrpc": "2.0",
 ///   "id": 4,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "attach",
+///       "asyncID": "rex-1780668734598-3",
+///       "read_timeout": 0
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```text
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 4,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": ""
+///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=attach, exited task):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 5,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "attach",
+///       "asyncID": "rex-1780668734667-4",
+///       "read_timeout": 0
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```text
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 5,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "task already exited with code 0
+/// late-exit"
+///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=attach, timeout task):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 6,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "attach",
+///       "asyncID": "rex-1780668734936-5",
+///       "read_timeout": 0
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```text
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 6,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "task already exited with code timeout"
+///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=stop):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 7,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "stop",
+///       "asyncID": "rex-1780668734598-3"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```text
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 7,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": ""
+///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=remove):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 8,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "remove",
+///       "asyncID": "rex-1780668734598-3"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```text
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 8,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "ok"
+///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=list, local tracked states):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 9,
 ///   "method": "tools/call",
 ///   "params": {
 ///     "name": "exbash",
@@ -723,14 +883,54 @@ pub fn rg() -> McpToolDef {
 /// ```text
 /// {
 ///   "jsonrpc": "2.0",
-///   "id": 4,
+///   "id": 9,
 ///   "result": {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "local:1 workspace:0
+///         "text": "local:6 workspace:0
 /// showing executor=local of local
-/// - local:rex-1780576006395-3 running totalOutput=0 command=sleep 5"
+/// - local:doc-running running totalOutput=0 command=sleep 30
+/// - local:doc-exit0 exit:0 totalOutput=13 command=echo all-good
+/// - local:doc-exit7 exit:7 totalOutput=0 command=false
+/// - local:doc-timeout timeout totalOutput=0 command=sleep 60
+/// - local:doc-stop stop totalOutput=0 command=sleep 60
+/// - local:doc-unknown2 unknown totalOutput=0 command=persisted abnormal state"
+///       }
+///     ]
+///   }
+/// }
+/// ```
+///
+/// Captured MCP input (mode=list, workspace tracked view):
+/// ```json
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 10,
+///   "method": "tools/call",
+///   "params": {
+///     "name": "exbash",
+///     "arguments": {
+///       "ExecutorSessionID": "codex-mcp-test",
+///       "mode": "list",
+///       "scope": "workspace"
+///     }
+///   }
+/// }
+/// ```
+///
+/// Captured MCP output:
+/// ```text
+/// {
+///   "jsonrpc": "2.0",
+///   "id": 10,
+///   "result": {
+///     "content": [
+///       {
+///         "type": "text",
+///         "text": "local:0 workspace:1
+/// showing executor=all of workspace
+/// - local:rex-1780668735154-6 running totalOutput=0 command=sleep 5"
 ///       }
 ///     ]
 ///   }
@@ -741,7 +941,7 @@ pub fn rg() -> McpToolDef {
 /// ```json
 /// {
 ///   "jsonrpc": "2.0",
-///   "id": 5,
+///   "id": 11,
 ///   "method": "tools/call",
 ///   "params": {
 ///     "name": "exbash",
@@ -759,152 +959,17 @@ pub fn rg() -> McpToolDef {
 /// ```text
 /// {
 ///   "jsonrpc": "2.0",
-///   "id": 5,
+///   "id": 11,
 ///   "result": {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "local:1 workspace:0
+///         "text": "local:0 workspace:0
 /// showing executor=exec_1 of remote
-/// - rex-1780576007000-1 running totalOutput=0 command=sleep 30"
-///       }
-///     ]
-///   }
-/// }
-/// ```
-///
-/// Captured MCP input (mode=attach):
-/// ```json
-/// {
-///   "jsonrpc": "2.0",
-///   "id": 5,
-///   "method": "tools/call",
-///   "params": {
-///     "name": "exbash",
-///     "arguments": {
-///       "ExecutorSessionID": "codex-mcp-test",
-///       "mode": "attach",
-///       "asyncID": "rex-1780576006395-3",
-///       "read_timeout": 0,
-///       "executor": "local"
-///     }
-///   }
-/// }
-/// ```
-///
-/// Captured MCP output:
-/// ```text
-/// {
-///   "jsonrpc": "2.0",
-///   "id": 5,
-///   "result": {
-///     "content": [
-///       {
-///         "type": "text",
-///         "text": ""
-///       }
-///     ]
-///   }
-/// }
-/// ```
-///
-/// Captured MCP input (mode=stop):
-/// ```json
-/// {
-///   "jsonrpc": "2.0",
-///   "id": 6,
-///   "method": "tools/call",
-///   "params": {
-///     "name": "exbash",
-///     "arguments": {
-///       "ExecutorSessionID": "codex-mcp-test",
-///       "mode": "stop",
-///       "asyncID": "rex-1780576006395-3",
-///       "executor": "local"
-///     }
-///   }
-/// }
-/// ```
-///
-/// Captured MCP output:
-/// ```text
-/// {
-///   "jsonrpc": "2.0",
-///   "id": 6,
-///   "result": {
-///     "content": [
-///       {
-///         "type": "text",
-///         "text": ""
-///       }
-///     ]
-///   }
-/// }
-/// ```
-///
-/// Captured MCP input (mode=list, after stop):
-/// ```json
-/// {
-///   "jsonrpc": "2.0",
-///   "id": 7,
-///   "method": "tools/call",
-///   "params": {
-///     "name": "exbash",
-///     "arguments": {
-///       "ExecutorSessionID": "codex-mcp-test",
-///       "mode": "list",
-///       "executor": "local"
-///     }
-///   }
-/// }
-/// ```
-///
-/// Captured MCP output:
-/// ```text
-/// {
-///   "jsonrpc": "2.0",
-///   "id": 7,
-///   "result": {
-///     "content": [
-///       {
-///         "type": "text",
-///         "text": "local:1 workspace:0
-/// showing executor=local of local
-/// - local:rex-1780576006395-3 stop totalOutput=0 command=sleep 5"
-///       }
-///     ]
-///   }
-/// }
-/// ```
-///
-/// Captured MCP input (mode=remove):
-/// ```json
-/// {
-///   "jsonrpc": "2.0",
-///   "id": 7,
-///   "method": "tools/call",
-///   "params": {
-///     "name": "exbash",
-///     "arguments": {
-///       "ExecutorSessionID": "codex-mcp-test",
-///       "mode": "remove",
-///       "asyncID": "rex-1780576006395-3",
-///       "executor": "local"
-///     }
-///   }
-/// }
-/// ```
-///
-/// Captured MCP output:
-/// ```text
-/// {
-///   "jsonrpc": "2.0",
-///   "id": 7,
-///   "result": {
-///     "content": [
-///       {
-///         "type": "text",
-///         "text": "ok"
+/// - rex-1780669216537-1 running totalOutput=0 command=sleep 5
+/// - rex-1780669216551-2 exit:0 totalOutput=13 command=bash -lc sleep 0.1; echo remote-done
+/// - rex-1780669216565-3 timeout totalOutput=0 command=sleep 5
+/// - rex-1780669216579-4 stop totalOutput=0 command=sleep 5"
 ///       }
 ///     ]
 ///   }
@@ -913,7 +978,7 @@ pub fn rg() -> McpToolDef {
 pub fn exbash() -> McpToolDef {
     tool_def(
         "exbash",
-        "PTY-backed background terminal. `shell` is the default mode and should be used for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Tracked task states are `running`, `exit:<code>`, `timeout`, or `stop`. Remote executor state is lazy-tracked: successful calls update matching tracked entries, failed remote calls leave stored state unchanged.",
+        "PTY-backed background terminal. `shell` is the default mode and should be used for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Remote executor tracking is lazy: stored state is updated only after a successful executor call; failed remote calls leave stored state unchanged.",
         vec![],
         vec![
             exec_session_prop(),
@@ -952,7 +1017,7 @@ pub fn exbash() -> McpToolDef {
             prop("description", string_prop("Optional display text for the run. The description is shown in run listings and detached snapshots.")),
             prop("timeout", integer_prop("Total lifetime timeout in milliseconds. Omit, 0, or -1 to leave the run unmanaged.")),
             prop("read_timeout", integer_prop("How long to wait before returning. If the process is still running at timeout, the tool returns a detached snapshot with `asyncID`.")),
-            prop("asyncID", string_prop("Run id returned by detached `run` or `attach`; required for `attach`, `list`, `stop`, and `remove`.")),
+            prop("asyncID", string_prop("Run id returned by detached `run` or `shell`; required for `attach`, `stop`, and `remove`.")),
             prop("text", string_prop("Text to write to PTY stdin in `attach` mode. Common escape sequences are interpreted.")),
             prop("filePath", string_prop("File path for `attach` mode input. Mutually exclusive with `text`.")),
             prop("workdir", string_prop("Working directory for `run` and `shell` commands.")),

@@ -11,12 +11,19 @@ pub use handler::{
 };
 
 pub const EXECUTOR_SESSION_PARAM: &str = "ExecutorSessionID";
+pub const INCLUDE_STRUCTURED_CONTENT_PARAM: &str = "includeStructuredContent";
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct McpCallContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_structured_content: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -82,10 +89,12 @@ impl<H: McpToolHandler> JsonRpcHandler for EmbeddedMcp<H> {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 let context = extract_context(&mut arguments);
-                Ok(
-                    serde_json::to_value(self.handler.call_tool(name, arguments, context).await?)
-                        .unwrap(),
-                )
+                let include_structured_content = context.include_structured_content;
+                let mut result = self.handler.call_tool(name, arguments, context).await?;
+                if !include_structured_content {
+                    result.structured_content = None;
+                }
+                Ok(serde_json::to_value(result).unwrap())
             }
             _ => Err(JsonRpcError::method_not_found(method)),
         }
@@ -99,8 +108,17 @@ fn extract_context(arguments: &mut Value) -> McpCallContext {
     let executor_session_id = object
         .remove(EXECUTOR_SESSION_PARAM)
         .and_then(|value| value.as_str().map(str::to_string));
+    let include_structured_content = object
+        .remove(INCLUDE_STRUCTURED_CONTENT_PARAM)
+        .and_then(|value| match value {
+            Value::Bool(value) => Some(value),
+            Value::String(value) => Some(value.eq_ignore_ascii_case("true")),
+            _ => None,
+        })
+        .unwrap_or(false);
     McpCallContext {
         executor_session_id,
+        include_structured_content,
     }
 }
 
@@ -128,7 +146,7 @@ mod tests {
             Ok(vec![McpToolDef {
                 name: "demo".into(),
                 description: None,
-                input_schema: json!({ "type": "object", "properties": { EXECUTOR_SESSION_PARAM: { "type": "string" } } }),
+                input_schema: json!({ "type": "object", "properties": { EXECUTOR_SESSION_PARAM: { "type": "string" }, INCLUDE_STRUCTURED_CONTENT_PARAM: { "type": "boolean", "default": false } } }),
             }])
         }
 
@@ -139,9 +157,11 @@ mod tests {
             context: McpCallContext,
         ) -> Result<McpCallResult, JsonRpcError> {
             assert!(arguments.get(EXECUTOR_SESSION_PARAM).is_none());
+            assert!(arguments.get(INCLUDE_STRUCTURED_CONTENT_PARAM).is_none());
+            let session_id = context.executor_session_id.unwrap_or_default();
             Ok(text_result(
-                context.executor_session_id.unwrap_or_default(),
-                None,
+                session_id.clone(),
+                Some(json!({ "metadata": { "session": session_id } })),
             ))
         }
     }
@@ -157,7 +177,23 @@ mod tests {
                 ["type"],
             "string"
         );
+        assert_eq!(
+            listed["result"]["tools"][0]["inputSchema"]["properties"]
+                [INCLUDE_STRUCTURED_CONTENT_PARAM]["default"],
+            false
+        );
         let called = endpoint.handle_value(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "demo", "arguments": { EXECUTOR_SESSION_PARAM: "ses_1" } } })).await;
         assert_eq!(called["result"]["content"][0]["text"], "ses_1");
+        assert!(called["result"]["structuredContent"].is_null());
+    }
+
+    #[tokio::test]
+    async fn returns_structured_content_only_when_requested() {
+        let endpoint = JsonRpcEndpoint::new(EmbeddedMcp::new(Demo));
+        let called = endpoint.handle_value(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "demo", "arguments": { EXECUTOR_SESSION_PARAM: "ses_1", INCLUDE_STRUCTURED_CONTENT_PARAM: true } } })).await;
+        assert_eq!(
+            called["result"]["structuredContent"]["metadata"]["session"],
+            "ses_1"
+        );
     }
 }

@@ -49,6 +49,18 @@ async fn call(
     ep.handle_value(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}})).await
 }
 
+async fn call_structured(
+    ep: &JsonRpcEndpoint<impl JsonRpcHandler>,
+    session_id: &str,
+    tool: &str,
+    mut args: Value,
+) -> Value {
+    if let Some(object) = args.as_object_mut() {
+        object.insert("includeStructuredContent".to_string(), Value::Bool(true));
+    }
+    call(ep, session_id, tool, args).await
+}
+
 fn text(r: &Value) -> String {
     r["result"]["content"][0]["text"]
         .as_str()
@@ -279,7 +291,7 @@ async fn run_session(
                 }
                 call(ep, &session_id, "FileAction", json!({"mode":"delete","fileKey":key,"executor":file_executor})).await
             }
-            Action::ExbashRun { command } => call(ep, &session_id, "exbash", json!({"mode":"run","command":command,"read_timeout":5000,"executor":executor})).await,
+            Action::ExbashRun { command } => call_structured(ep, &session_id, "exbash", json!({"mode":"run","command":command,"read_timeout":5000,"executor":executor})).await,
             Action::ExbashList => call(ep, &session_id, "exbash", json!({"mode":"list","executor":executor})).await,
             Action::ExbashStop { task_idx } => match task_ids[*task_idx].as_deref() {
                 Some(aid) => call(ep, &session_id, "exbash", json!({"mode":"stop","asyncID":aid,"executor":executor})).await,
@@ -563,12 +575,17 @@ async fn exbash_workdir_tracks_specified_directory() {
         "exbash run with workdir failed: {:?}",
         resp["error"]
     );
-    let sc = resp["result"]["structuredContent"].clone();
-    let md = sc.get("metadata").cloned().unwrap_or(Value::Null);
-    let exit_code = md.get("exitCode").and_then(|v| v.as_i64());
-    assert_eq!(exit_code, Some(0), "exbash with workdir should exit 0");
 
     let output_text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        resp["result"]["structuredContent"].is_null(),
+        "structuredContent should be omitted by default"
+    );
+    assert!(
+        output_text.ends_with("exitcode:0"),
+        "exbash with workdir should exit 0, got: {}",
+        output_text.trim()
+    );
     let workdir_path = workdir.path().to_string_lossy();
     println!("exbash with workdir: pwd output = {}", output_text.trim());
     println!("expected workdir = {}", workdir_path);
@@ -658,7 +675,7 @@ async fn exbash_plaintext_exitcode_defaults_and_list_scope() {
         default_shell_text
     );
 
-    let detached = call(
+    let detached = call_structured(
         &ep,
         "ses_exbash_plain",
         "exbash",
@@ -753,7 +770,10 @@ async fn manager_list_shells_routes_through_executor() {
         "list_shells output should contain plaintext shell settings, got: {:?}",
         output
     );
-    assert!(meta(&response)["metadata"]["profiles"].is_object());
+    assert!(
+        response["result"]["structuredContent"].is_null(),
+        "structuredContent should be omitted by default"
+    );
 }
 
 #[tokio::test]
@@ -820,7 +840,7 @@ async fn rg_files_mode_matches_paths_by_glob_pattern() {
         shell_manager,
     ));
 
-    let response = call(
+    let response = call_structured(
         &ep,
         "ses_rg_files",
         "rg",

@@ -1,5 +1,4 @@
-use crate::mcp::McpToolDef;
-use crate::mcp::EXECUTOR_SESSION_PARAM;
+use crate::mcp::{McpToolDef, EXECUTOR_SESSION_PARAM, INCLUDE_STRUCTURED_CONTENT_PARAM};
 use serde_json::{json, Map, Value};
 
 fn prop(name: &str, schema: Value) -> (String, Value) {
@@ -53,6 +52,13 @@ fn exec_session_prop() -> (String, Value) {
     )
 }
 
+fn include_structured_content_schema() -> Value {
+    boolean_default(
+        "Return structuredContent metadata in addition to plaintext content.",
+        false,
+    )
+}
+
 fn executor_prop() -> (String, Value) {
     prop("executor", string_default("Target executor id", "local"))
 }
@@ -74,6 +80,9 @@ fn tool_def(
             has_executor_session = true;
             continue;
         }
+        if k == INCLUDE_STRUCTURED_CONTENT_PARAM {
+            continue;
+        }
         props.insert(k, v);
     }
     if has_executor_session {
@@ -82,12 +91,21 @@ fn tool_def(
             EXECUTOR_SESSION_PARAM.to_string(),
             string_prop("Session id; filled by the host system."),
         );
+        ordered.insert(
+            INCLUDE_STRUCTURED_CONTENT_PARAM.to_string(),
+            include_structured_content_schema(),
+        );
         for (k, v) in props {
             ordered.insert(k, v);
         }
         props = ordered;
         required.retain(|item| *item != EXECUTOR_SESSION_PARAM);
         required.insert(0, EXECUTOR_SESSION_PARAM);
+    } else {
+        props.insert(
+            INCLUDE_STRUCTURED_CONTENT_PARAM.to_string(),
+            include_structured_content_schema(),
+        );
     }
     let schema = json!({
         "type": "object",
@@ -113,6 +131,7 @@ fn tool_def(
 ///     "name": "FileAction",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "create",
 ///       "fileKey": "demo.rs",
 ///       "content": "fn main() {\n    println!(\"hello\");\n}\n",
@@ -148,6 +167,7 @@ fn tool_def(
 ///     "name": "FileAction",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "patch",
 ///       "fileKey": "demo.rs #8EBE",
 ///       "patchText": "insert -1\n+// patched\n",
@@ -183,6 +203,7 @@ fn tool_def(
 ///     "name": "FileAction",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "rename",
 ///       "fileKey": "demo.rs #8EBE",
 ///       "newFilePath": "/tmp/refs-mcp-examples-vtOsrZ/renamed.rs",
@@ -218,6 +239,7 @@ fn tool_def(
 ///     "name": "FileAction",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "delete",
 ///       "fileKey": "renamed.rs #8EBE",
 ///       "executor": "local"
@@ -288,6 +310,7 @@ pub fn file_action() -> McpToolDef {
 ///     "name": "read",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "fileKey": "demo.rs",
 ///       "mode": "text",
 ///       "limit": 3,
@@ -336,6 +359,7 @@ pub fn file_action() -> McpToolDef {
 ///     "name": "read",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "fileKey": "demo.rs #8EBE",
 ///       "mode": "binary",
 ///       "offset": 0,
@@ -410,6 +434,7 @@ pub fn read() -> McpToolDef {
 ///     "name": "rg",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "pattern": "fn",
 ///       "path": "/tmp/.tmp8V7Cxa",
 ///       "executor": "local"
@@ -450,6 +475,7 @@ pub fn read() -> McpToolDef {
 ///     "name": "rg",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "files",
 ///       "pattern": "*.rs",
 ///       "path": "/tmp/.tmp8V7Cxa",
@@ -539,6 +565,7 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "run",
 ///       "command": "echo hello from exbash",
 ///       "read_timeout": 5000,
@@ -580,6 +607,7 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "shell",
 ///       "command": "echo shell-ok",
 ///       "read_timeout": 5000,
@@ -621,6 +649,7 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "run",
 ///       "command": "sleep 5",
 ///       "read_timeout": 10,
@@ -681,6 +710,7 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "list",
 ///       "executor": "local"
 ///     }
@@ -736,6 +766,7 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "attach",
 ///       "asyncID": "rex-1780576006395-3",
 ///       "read_timeout": 0,
@@ -784,6 +815,7 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "stop",
 ///       "asyncID": "rex-1780576006395-3",
 ///       "executor": "local"
@@ -833,6 +865,7 @@ pub fn rg() -> McpToolDef {
 ///     "name": "exbash",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "mode": "remove",
 ///       "asyncID": "rex-1780576006395-3",
 ///       "executor": "local"
@@ -924,6 +957,7 @@ pub fn exbash() -> McpToolDef {
 ///     "name": "RemoteExecutorManager",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "method": "list_executor",
 ///       "id": "0",
 ///       "executor": "local"
@@ -977,6 +1011,7 @@ pub fn exbash() -> McpToolDef {
 ///     "name": "RemoteExecutorManager",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "method": "connect_to_executor",
 ///       "id": "loopback",
 ///       "url": "ws://127.0.0.1:44881",
@@ -1044,6 +1079,7 @@ pub fn exbash() -> McpToolDef {
 ///     "name": "RemoteExecutorManager",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "method": "list_shells"
 ///     }
 ///   }
@@ -1142,6 +1178,7 @@ pub fn exbash() -> McpToolDef {
 ///     "name": "RemoteExecutorManager",
 ///     "arguments": {
 ///       "ExecutorSessionID": "codex-mcp-test",
+///       "includeStructuredContent": true,
 ///       "method": "set_executor_shell",
 ///       "executor": "local",
 ///       "shell": "auto"

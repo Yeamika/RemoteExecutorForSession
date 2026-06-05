@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,6 +18,42 @@ const SESSION_COUNT: usize = 64;
 const CALLS_PER_SESSION: usize = 16;
 const EXECUTOR_COUNT: usize = 4;
 const DIR_COUNT: usize = 8;
+const MATRIX_SESSION_COUNT: usize = 128;
+const MATRIX_CALLS_PER_SESSION: usize = 16;
+const MATRIX_FILES_PER_SESSION: usize = 4;
+const MATRIX_CONFLICT_FILE_COUNT: usize = 16;
+
+fn matrix_conflict_attempts_per_session() -> usize {
+    MATRIX_CALLS_PER_SESSION / 2
+}
+
+fn matrix_unique_patch_count() -> usize {
+    (MATRIX_CALLS_PER_SESSION / 2) - MATRIX_FILES_PER_SESSION
+}
+
+fn matrix_session_id(session_idx: usize) -> String {
+    format!("matrix_{session_idx:04}")
+}
+
+fn matrix_unique_file_name(session_idx: usize, file_idx: usize) -> String {
+    format!("matrix_s{session_idx:04}_f{file_idx:02}.txt")
+}
+
+fn matrix_unique_patch_target(session_idx: usize, patch_idx: usize) -> usize {
+    rng(0xA11CE + session_idx * 4099 + patch_idx * 131) % MATRIX_FILES_PER_SESSION
+}
+
+fn matrix_unique_marker(session_idx: usize, file_idx: usize, patch_idx: usize) -> String {
+    format!("unique session={session_idx:04} file={file_idx:02} patch={patch_idx:02}\n")
+}
+
+fn matrix_conflict_target(session_idx: usize, attempt_idx: usize) -> usize {
+    (session_idx * 37 + attempt_idx * 11 + rng(0xC0FFEE + attempt_idx)) % MATRIX_CONFLICT_FILE_COUNT
+}
+
+fn matrix_conflict_marker(session_idx: usize, attempt_idx: usize, file_idx: usize) -> String {
+    format!("conflict session={session_idx:04} attempt={attempt_idx:02} file={file_idx:02}\n")
+}
 
 fn rng(seed: usize) -> usize {
     let mut x = seed
@@ -81,6 +119,63 @@ fn is_transient_error(r: &Value) -> bool {
     msg.contains("PTY")
         || msg.contains("ShellManager")
         || msg.contains("another write operation is already running")
+}
+
+fn is_write_busy(r: &Value) -> bool {
+    r["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("another write operation is already running")
+}
+
+fn is_hash_mismatch(r: &Value) -> bool {
+    r["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("hash mismatch")
+}
+
+fn file_ref_from_text(output: &str) -> Option<String> {
+    const START: &str = "<fileRef>";
+    const END: &str = "</fileRef>";
+    output.lines().find_map(|line| {
+        let start = line.find(START)?;
+        let rest = &line[start + START.len()..];
+        let end = rest.find(END)?;
+        let label = rest[..end].trim();
+        (!label.is_empty()).then(|| label.to_string())
+    })
+}
+
+fn binary_append_patch(text: &str) -> String {
+    let mut hex = String::with_capacity(text.len() * 2);
+    for byte in text.as_bytes() {
+        write!(&mut hex, "{byte:02X}").unwrap();
+    }
+    format!("insert -1\n+{hex}")
+}
+
+async fn call_retry_write_busy(
+    ep: &JsonRpcEndpoint<impl JsonRpcHandler>,
+    session_id: &str,
+    tool: &str,
+    args: Value,
+    seed: usize,
+) -> (Value, usize) {
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        let resp = call(ep, session_id, tool, args.clone()).await;
+        if !is_write_busy(&resp) {
+            return (resp, attempts);
+        }
+        assert!(
+            attempts < 20_000,
+            "write stayed busy after {attempts} attempts for {tool}"
+        );
+        let delay_ms = 1 + (rng(seed.wrapping_add(attempts)) % 9) as u64;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
 }
 
 fn exbash_limit_task(id: usize) -> ExbashSyncInput {
@@ -487,6 +582,355 @@ async fn run_session(
         file_refs,
         task_ids,
     }
+}
+
+struct MatrixUniqueResult {
+    busy_retries: usize,
+}
+
+struct MatrixConflictResult {
+    busy_retries: usize,
+    success_markers: Vec<(usize, String)>,
+    hash_mismatches: usize,
+}
+
+async fn run_matrix_unique_session(
+    si: usize,
+    ep: &JsonRpcEndpoint<impl JsonRpcHandler>,
+    dir: &std::path::Path,
+) -> MatrixUniqueResult {
+    let session_id = matrix_session_id(si);
+    let mut file_refs = Vec::with_capacity(MATRIX_FILES_PER_SESSION);
+    let mut expected_markers = vec![Vec::<String>::new(); MATRIX_FILES_PER_SESSION];
+    let mut busy_retries = 0usize;
+
+    for file_idx in 0..MATRIX_FILES_PER_SESSION {
+        let file_name = matrix_unique_file_name(si, file_idx);
+        let content = format!("base session={si:04} file={file_idx:02}\n");
+        let (resp, attempts) = call_retry_write_busy(
+            ep,
+            &session_id,
+            "FileAction",
+            json!({
+                "mode": "create",
+                "fileKey": dir.join(&file_name).to_string_lossy(),
+                "content": content,
+                "executor": "local"
+            }),
+            0x1000 + si * 97 + file_idx,
+        )
+        .await;
+        busy_retries += attempts - 1;
+        assert!(
+            resp["error"].is_null(),
+            "matrix create failed for {file_name}: {:?}",
+            resp["error"]
+        );
+        let file_ref = file_ref_from_text(&text(&resp))
+            .unwrap_or_else(|| panic!("create did not return fileRef for {file_name}: {resp:?}"));
+        file_refs.push(file_ref);
+    }
+
+    for patch_idx in 0..matrix_unique_patch_count() {
+        let file_idx = matrix_unique_patch_target(si, patch_idx);
+        let marker = matrix_unique_marker(si, file_idx, patch_idx);
+        let (resp, attempts) = call_retry_write_busy(
+            ep,
+            &session_id,
+            "FileAction",
+            json!({
+                "mode": "patch",
+                "fileKey": file_refs[file_idx],
+                "patchMode": "binary",
+                "patchText": binary_append_patch(&marker),
+                "executor": "local"
+            }),
+            0x2000 + si * 131 + patch_idx,
+        )
+        .await;
+        busy_retries += attempts - 1;
+        assert!(
+            resp["error"].is_null(),
+            "matrix unique patch failed for session={si} file={file_idx}: {:?}",
+            resp["error"]
+        );
+        let file_ref = file_ref_from_text(&text(&resp)).unwrap_or_else(|| {
+            panic!("unique patch did not return fileRef for session={si} file={file_idx}: {resp:?}")
+        });
+        file_refs[file_idx] = file_ref;
+        expected_markers[file_idx].push(marker);
+    }
+
+    for (file_idx, markers) in expected_markers.iter().enumerate() {
+        let file_name = matrix_unique_file_name(si, file_idx);
+        let content = std::fs::read_to_string(dir.join(&file_name))
+            .unwrap_or_else(|err| panic!("failed to read {file_name}: {err}"));
+        assert!(
+            content.starts_with(&format!("base session={si:04} file={file_idx:02}\n")),
+            "unique file {file_name} lost its base content: {content:?}"
+        );
+        for marker in markers {
+            assert!(
+                content.contains(marker),
+                "unique file {file_name} missing marker {marker:?}; content={content:?}"
+            );
+        }
+        let actual_marker_count = content
+            .lines()
+            .filter(|line| line.starts_with("unique session="))
+            .count();
+        assert_eq!(
+            actual_marker_count,
+            markers.len(),
+            "unique file {file_name} has unexpected marker count; content={content:?}"
+        );
+    }
+
+    MatrixUniqueResult { busy_retries }
+}
+
+async fn read_matrix_conflict_refs(
+    si: usize,
+    ep: &JsonRpcEndpoint<impl JsonRpcHandler>,
+    dir: &std::path::Path,
+) -> Vec<Option<String>> {
+    let session_id = matrix_session_id(si);
+    let mut refs = vec![None; MATRIX_CONFLICT_FILE_COUNT];
+    let targets = (0..matrix_conflict_attempts_per_session())
+        .map(|attempt_idx| matrix_conflict_target(si, attempt_idx))
+        .collect::<HashSet<_>>();
+
+    for file_idx in targets {
+        let file_name = format!("matrix_conflict_{file_idx:02}.txt");
+        let resp = call(
+            ep,
+            &session_id,
+            "read",
+            json!({
+                "fileKey": dir.join(&file_name).to_string_lossy(),
+                "hashCheckMode": true,
+                "executor": "local"
+            }),
+        )
+        .await;
+        assert!(
+            resp["error"].is_null(),
+            "matrix conflict read failed for session={si} file={file_idx}: {:?}",
+            resp["error"]
+        );
+        refs[file_idx] = Some(file_ref_from_text(&text(&resp)).unwrap_or_else(|| {
+            panic!(
+                "read did not return conflict fileRef for session={si} file={file_idx}: {resp:?}"
+            )
+        }));
+    }
+
+    refs
+}
+
+async fn run_matrix_conflict_session(
+    si: usize,
+    ep: &JsonRpcEndpoint<impl JsonRpcHandler>,
+    refs: Vec<Option<String>>,
+) -> MatrixConflictResult {
+    let session_id = matrix_session_id(si);
+    let mut busy_retries = 0usize;
+    let mut success_markers = Vec::new();
+    let mut hash_mismatches = 0usize;
+
+    for attempt_idx in 0..matrix_conflict_attempts_per_session() {
+        let file_idx = matrix_conflict_target(si, attempt_idx);
+        let marker = matrix_conflict_marker(si, attempt_idx, file_idx);
+        let file_ref = refs[file_idx]
+            .as_ref()
+            .unwrap_or_else(|| panic!("missing conflict ref session={si} file={file_idx}"));
+        let (resp, attempts) = call_retry_write_busy(
+            ep,
+            &session_id,
+            "FileAction",
+            json!({
+                "mode": "patch",
+                "fileKey": file_ref,
+                "patchMode": "binary",
+                "patchText": binary_append_patch(&marker),
+                "executor": "local"
+            }),
+            0x3000 + si * 193 + attempt_idx,
+        )
+        .await;
+        busy_retries += attempts - 1;
+        if resp["error"].is_null() {
+            success_markers.push((file_idx, marker));
+        } else if is_hash_mismatch(&resp) {
+            hash_mismatches += 1;
+        } else {
+            panic!(
+                "matrix conflict patch returned unexpected error for session={si} file={file_idx}: {:?}",
+                resp["error"]
+            );
+        }
+    }
+
+    MatrixConflictResult {
+        busy_retries,
+        success_markers,
+        hash_mismatches,
+    }
+}
+
+#[tokio::test]
+async fn stress_rpc_128x16_parallel_random_writes() {
+    let start = Instant::now();
+    let dir = tempfile::tempdir().unwrap();
+    for file_idx in 0..MATRIX_CONFLICT_FILE_COUNT {
+        std::fs::write(
+            dir.path()
+                .join(format!("matrix_conflict_{file_idx:02}.txt")),
+            format!("conflict base file={file_idx:02}\n"),
+        )
+        .unwrap();
+    }
+
+    let shared_manager = Arc::new(new_manager().await.unwrap());
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let mut eps: Vec<JsonRpcEndpoint<_>> = Vec::with_capacity(MATRIX_SESSION_COUNT);
+    for si in 0..MATRIX_SESSION_COUNT {
+        let session_id = matrix_session_id(si);
+        let host = Arc::new(MemorySessionHost::new(
+            session_id,
+            dir.path().to_string_lossy(),
+        ));
+        let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+        eps.push(JsonRpcEndpoint::new(create_session_mcp_with_manager(
+            ctx,
+            host,
+            shared_manager.clone(),
+            shell_manager.clone(),
+        )));
+    }
+
+    let lists = futures_util::future::join_all(
+        eps.iter()
+            .map(|ep| ep.handle_value(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))),
+    )
+    .await;
+    for r in &lists {
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 5);
+    }
+
+    let unique_started = Instant::now();
+    let unique_results = futures_util::future::join_all(
+        (0..MATRIX_SESSION_COUNT).map(|si| run_matrix_unique_session(si, &eps[si], dir.path())),
+    )
+    .await;
+    let unique_elapsed = unique_started.elapsed();
+    let unique_busy_retries: usize = unique_results
+        .iter()
+        .map(|result| result.busy_retries)
+        .sum();
+
+    let refs_started = Instant::now();
+    let conflict_refs = futures_util::future::join_all(
+        (0..MATRIX_SESSION_COUNT).map(|si| read_matrix_conflict_refs(si, &eps[si], dir.path())),
+    )
+    .await;
+    let refs_elapsed = refs_started.elapsed();
+
+    let conflict_started = Instant::now();
+    let conflict_results = futures_util::future::join_all(
+        (0..MATRIX_SESSION_COUNT)
+            .map(|si| run_matrix_conflict_session(si, &eps[si], conflict_refs[si].clone())),
+    )
+    .await;
+    let conflict_elapsed = conflict_started.elapsed();
+
+    let mut success_by_file = vec![Vec::<String>::new(); MATRIX_CONFLICT_FILE_COUNT];
+    let mut conflict_busy_retries = 0usize;
+    let mut hash_mismatches = 0usize;
+    for result in &conflict_results {
+        conflict_busy_retries += result.busy_retries;
+        hash_mismatches += result.hash_mismatches;
+        for (file_idx, marker) in &result.success_markers {
+            success_by_file[*file_idx].push(marker.clone());
+        }
+    }
+    let conflict_successes: usize = success_by_file.iter().map(Vec::len).sum();
+    let conflict_attempts = MATRIX_SESSION_COUNT * matrix_conflict_attempts_per_session();
+    assert_eq!(
+        conflict_successes + hash_mismatches,
+        conflict_attempts,
+        "all conflict writes should either succeed once per stale hash or fail by hash mismatch"
+    );
+    assert!(
+        conflict_successes <= MATRIX_CONFLICT_FILE_COUNT,
+        "each conflict file should accept at most one stale-hash write"
+    );
+    assert!(
+        conflict_successes > 0,
+        "conflict matrix should exercise successful writes before stale hashes are rejected"
+    );
+    assert!(
+        hash_mismatches > 0,
+        "conflict matrix should exercise stale hash rejection"
+    );
+
+    for (file_idx, expected_markers) in success_by_file.iter().enumerate() {
+        assert!(
+            expected_markers.len() <= 1,
+            "conflict file {file_idx} accepted multiple stale-hash writes: {expected_markers:?}"
+        );
+        let file_name = format!("matrix_conflict_{file_idx:02}.txt");
+        let content = std::fs::read_to_string(dir.path().join(&file_name)).unwrap();
+        assert!(
+            content.starts_with(&format!("conflict base file={file_idx:02}\n")),
+            "conflict file {file_name} lost base content: {content:?}"
+        );
+        for marker in expected_markers {
+            assert!(
+                content.contains(marker),
+                "conflict file {file_name} missing successful marker {marker:?}: {content:?}"
+            );
+        }
+        let actual_markers = content
+            .lines()
+            .filter(|line| line.starts_with("conflict session="))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_markers.len(),
+            expected_markers.len(),
+            "conflict file {file_name} contains untracked writes: {content:?}"
+        );
+        for marker in actual_markers {
+            assert!(
+                expected_markers
+                    .iter()
+                    .any(|expected| expected.trim_end() == marker),
+                "conflict file {file_name} contains unexpected marker {marker:?}: {content:?}"
+            );
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let matrix_calls = MATRIX_SESSION_COUNT * MATRIX_CALLS_PER_SESSION;
+    let ms_per_matrix_call = elapsed.as_millis() as f64 / matrix_calls as f64;
+    println!(
+        "stress 128x16 random writes: {} matrix calls, {} unique busy retries, {} conflict successes, {} hash mismatches, {} conflict busy retries, {:.1}ms/matrix-call, {:.1}s total (unique {:.1}s, ref-read {:.1}s, conflict {:.1}s)",
+        matrix_calls,
+        unique_busy_retries,
+        conflict_successes,
+        hash_mismatches,
+        conflict_busy_retries,
+        ms_per_matrix_call,
+        elapsed.as_secs_f64(),
+        unique_elapsed.as_secs_f64(),
+        refs_elapsed.as_secs_f64(),
+        conflict_elapsed.as_secs_f64()
+    );
+    assert!(
+        ms_per_matrix_call < 300.0,
+        "average matrix call latency {:.1}ms exceeds 300ms target",
+        ms_per_matrix_call
+    );
 }
 
 #[tokio::test]

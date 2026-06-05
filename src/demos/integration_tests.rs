@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use crate::demos::memory_host::MemorySessionHost;
@@ -93,6 +93,57 @@ fn exbash_limit_task(id: usize) -> ExbashSyncInput {
         command: Some(format!("echo {id}")),
         description: Some(format!("task {id}")),
         ..ExbashSyncInput::default()
+    }
+}
+
+async fn wait_for_session_exbash_state(
+    host: &MemorySessionHost,
+    session_id: &str,
+    async_id: &str,
+    expected_state: &str,
+) -> crate::types::ExbashTaskSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(snapshot) = host
+            .session_exbash_snapshot(session_id, async_id, "local")
+            .await
+            .unwrap()
+        {
+            if snapshot.state.as_deref() == Some(expected_state) {
+                return snapshot;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for session task {async_id} to reach {expected_state}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_workdir_exbash_state(
+    host: &MemorySessionHost,
+    session_id: &str,
+    workdir: &str,
+    async_id: &str,
+    expected_state: &str,
+) -> crate::types::ExbashTaskSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(snapshot) = host
+            .workdir_exbash_snapshot(session_id, workdir, async_id, "local")
+            .await
+            .unwrap()
+        {
+            if snapshot.state.as_deref() == Some(expected_state) {
+                return snapshot;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for workdir task {async_id} to reach {expected_state}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -832,6 +883,145 @@ async fn exbash_plaintext_exitcode_defaults_and_list_scope() {
         json!({"mode":"stop","asyncID":async_id}),
     )
     .await;
+}
+
+#[tokio::test]
+async fn exbash_local_terminal_events_sync_host_tracking() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_exbash_events",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host.clone(),
+        shared_manager,
+        shell_manager,
+    ));
+
+    let exited = call_structured(
+        &ep,
+        "ses_exbash_events",
+        "exbash",
+        json!({"mode":"run","command":"sh -lc 'sleep 0.05; exit 7'","read_timeout":0}),
+    )
+    .await;
+    assert!(
+        exited["error"].is_null(),
+        "detached exit run failed: {:?}",
+        exited["error"]
+    );
+    let exited_id = meta(&exited)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let exited_snapshot =
+        wait_for_session_exbash_state(host.as_ref(), "ses_exbash_events", &exited_id, "exit:7")
+            .await;
+    assert_eq!(exited_snapshot.exit_code, Some(7));
+    assert!(exited_snapshot.ended_at.is_some());
+
+    let timed_out = call_structured(
+        &ep,
+        "ses_exbash_events",
+        "exbash",
+        json!({"mode":"run","command":"sleep 5","timeout":50,"read_timeout":0}),
+    )
+    .await;
+    assert!(
+        timed_out["error"].is_null(),
+        "detached timeout run failed: {:?}",
+        timed_out["error"]
+    );
+    let timed_out_id = meta(&timed_out)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let timed_out_snapshot =
+        wait_for_session_exbash_state(host.as_ref(), "ses_exbash_events", &timed_out_id, "timeout")
+            .await;
+    assert!(timed_out_snapshot.ended_at.is_some());
+
+    let workspace = call_structured(
+        &ep,
+        "ses_exbash_events",
+        "exbash",
+        json!({"mode":"run","scope":"workspace","command":"sh -lc 'sleep 0.05; exit 0'","read_timeout":0}),
+    )
+    .await;
+    assert!(
+        workspace["error"].is_null(),
+        "detached workspace run failed: {:?}",
+        workspace["error"]
+    );
+    let workspace_id = meta(&workspace)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let workdir = dir.path().to_string_lossy();
+    let workspace_snapshot = wait_for_workdir_exbash_state(
+        host.as_ref(),
+        "ses_exbash_events",
+        &workdir,
+        &workspace_id,
+        "exit:0",
+    )
+    .await;
+    assert_eq!(workspace_snapshot.exit_code, Some(0));
+}
+
+#[tokio::test]
+async fn exbash_detached_run_returns_before_event_sync() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_exbash_perf",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host.clone(),
+        shared_manager,
+        shell_manager,
+    ));
+
+    let started = Instant::now();
+    let detached = call_structured(
+        &ep,
+        "ses_exbash_perf",
+        "exbash",
+        json!({"mode":"run","command":"sh -lc 'sleep 0.4; exit 0'","read_timeout":0}),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    println!(
+        "detached run returned in {:.2}ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        detached["error"].is_null(),
+        "detached run failed: {:?}",
+        detached["error"]
+    );
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "detached run should not wait for process exit, elapsed={elapsed:?}"
+    );
+    let async_id = meta(&detached)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let snapshot =
+        wait_for_session_exbash_state(host.as_ref(), "ses_exbash_perf", &async_id, "exit:0").await;
+    assert_eq!(snapshot.exit_code, Some(0));
 }
 
 #[tokio::test]

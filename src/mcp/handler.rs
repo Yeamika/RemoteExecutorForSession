@@ -67,7 +67,7 @@ pub struct SessionMcpHandler<H: SessionHost> {
     manager: OnceCell<SharedManager>,
 }
 
-impl<H: SessionHost> SessionMcpHandler<H> {
+impl<H: SessionHost + 'static> SessionMcpHandler<H> {
     async fn scope(&self, context: McpCallContext) -> Result<CallScope, JsonRpcError> {
         let session_id = context
             .executor_session_id
@@ -204,14 +204,10 @@ impl<H: SessionHost> SessionMcpHandler<H> {
             .map(str::to_string);
         let state = Some(normalized_exbash_state(result, requested_mode, None));
         let exit_code = metadata_exit_code_i32(result);
-        let pid = result.pointer("/metadata/pid").and_then(Value::as_i64);
-        let started_at = result
-            .pointer("/metadata/startedAt")
-            .and_then(Value::as_i64);
-        let ended_at = result.pointer("/metadata/endedAt").and_then(Value::as_i64);
-        let total_output = result
-            .pointer("/metadata/totalOutput")
-            .and_then(Value::as_i64);
+        let pid = metadata_i64(result, "pid");
+        let started_at = metadata_i64(result, "startedAt");
+        let ended_at = metadata_i64(result, "endedAt");
+        let total_output = metadata_i64(result, "totalOutput");
         let input = ExbashSyncInput {
             async_id: Some(async_id),
             session_id: None,
@@ -229,21 +225,25 @@ impl<H: SessionHost> SessionMcpHandler<H> {
         if tracking_scope == "remote" {
             return None;
         }
-        if tracking_scope == "workspace" {
+        let snapshot = if tracking_scope == "workspace" {
             let wd_input = ExbashSyncInput {
                 session_id: Some(scope.session_id.clone()),
                 ..input
             };
-            return self
-                .host
+            self.host
                 .upsert_workdir_exbash(&scope.session_id, &scope.workdir, wd_input)
                 .await
-                .ok();
+                .ok()
+        } else {
+            self.host
+                .upsert_session_exbash(&scope.session_id, input)
+                .await
+                .ok()
+        };
+        if let Some(snapshot) = snapshot.as_ref() {
+            self.spawn_local_exbash_terminal_sync(scope, tracking_scope, snapshot);
         }
-        self.host
-            .upsert_session_exbash(&scope.session_id, input)
-            .await
-            .ok()
+        snapshot
     }
 
     async fn remove_exbash_tracking(
@@ -308,6 +308,76 @@ impl<H: SessionHost> SessionMcpHandler<H> {
             );
         }
         Ok(snapshots)
+    }
+
+    fn spawn_local_exbash_terminal_sync(
+        &self,
+        scope: &CallScope,
+        tracking_scope: &str,
+        snapshot: &ExbashTaskSnapshot,
+    ) {
+        if snapshot.executor != "local" || snapshot.state.as_deref() != Some("running") {
+            return;
+        }
+        let Some(manager) = self.manager.get().cloned() else {
+            return;
+        };
+        let host = Arc::clone(&self.host);
+        let scope = scope.clone();
+        let tracking_scope = tracking_scope.to_string();
+        let async_id = snapshot.async_id.clone();
+        let mut exit_rx = match manager.subscribe_local_exit_code(&async_id) {
+            Ok(rx) => rx,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            if exit_rx.recv().await.is_none() {
+                return;
+            }
+            let Ok(run) = manager.local_exbash_run_detail(&async_id) else {
+                return;
+            };
+            let result = json!({ "metadata": run });
+            Self::sync_local_exbash_terminal_result(host, scope, tracking_scope, async_id, result)
+                .await;
+        });
+    }
+
+    async fn sync_local_exbash_terminal_result(
+        host: Arc<H>,
+        scope: CallScope,
+        tracking_scope: String,
+        async_id: String,
+        result: Value,
+    ) {
+        if tracking_scope == "workspace" {
+            let Ok(Some(existing)) = host
+                .workdir_exbash_snapshot(&scope.session_id, &scope.workdir, &async_id, "local")
+                .await
+            else {
+                return;
+            };
+            if existing.state.as_deref() != Some("running") {
+                return;
+            }
+            let input = exbash_sync_input_from_existing(&existing, &result, "event");
+            let _ = host
+                .upsert_workdir_exbash(&scope.session_id, &scope.workdir, input)
+                .await;
+            return;
+        }
+
+        let Ok(Some(existing)) = host
+            .session_exbash_snapshot(&scope.session_id, &async_id, "local")
+            .await
+        else {
+            return;
+        };
+        if existing.state.as_deref() != Some("running") {
+            return;
+        }
+        let input = exbash_sync_input_from_existing(&existing, &result, "event");
+        let _ = host.upsert_session_exbash(&scope.session_id, input).await;
     }
 
     async fn call_via_manager(
@@ -613,24 +683,37 @@ fn metadata_string(value: &Value, field: &str) -> Option<String> {
 }
 
 fn metadata_i64(value: &Value, field: &str) -> Option<i64> {
+    json_i64(
+        value
+            .get("metadata")
+            .and_then(|metadata| metadata.get(field))?,
+    )
+}
+
+fn json_i64(value: &Value) -> Option<i64> {
     value
-        .get("metadata")
-        .and_then(|metadata| metadata.get(field))
-        .and_then(Value::as_i64)
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        .or_else(|| value.as_str()?.parse::<i64>().ok())
+}
+
+fn json_i32(value: &Value) -> Option<i32> {
+    value
+        .as_i64()
+        .and_then(|number| i32::try_from(number).ok())
+        .or_else(|| value.as_u64().and_then(|number| i32::try_from(number).ok()))
+        .or_else(|| value.as_str()?.parse::<i32>().ok())
 }
 
 fn metadata_exit_code_i32(value: &Value) -> Option<i32> {
     let exit_code = value
         .get("metadata")
         .and_then(|metadata| metadata.get("exitCode"))?;
-    exit_code
-        .as_i64()
-        .map(|number| number as i32)
-        .or_else(|| exit_code.as_str()?.parse::<i32>().ok())
+    json_i32(exit_code)
 }
 
 fn normalized_exit_state(exit_code: &Value) -> Option<String> {
-    if let Some(number) = exit_code.as_i64() {
+    if let Some(number) = json_i64(exit_code) {
         return Some(format!("exit:{number}"));
     }
     let text = exit_code.as_str()?.trim();

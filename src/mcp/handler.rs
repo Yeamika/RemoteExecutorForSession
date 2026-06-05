@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
 
 type SharedManager = Arc<Caller>;
@@ -179,11 +180,11 @@ impl<H: SessionHost> SessionMcpHandler<H> {
         scope: &CallScope,
         result: &serde_json::Value,
         tracking_scope: &str,
+        requested_mode: &str,
     ) -> Option<ExbashTaskSnapshot> {
-        let mode = result
-            .pointer("/metadata/mode")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
+        if !exbash_mode_creates_task(requested_mode) {
+            return None;
+        }
         let async_id = result
             .pointer("/metadata/asyncID")
             .and_then(Value::as_str)
@@ -201,14 +202,8 @@ impl<H: SessionHost> SessionMcpHandler<H> {
             .pointer("/metadata/description")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let state = result
-            .pointer("/metadata/state")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let exit_code = result
-            .pointer("/metadata/exitCode")
-            .and_then(Value::as_i64)
-            .map(|n| n as i32);
+        let state = Some(normalized_exbash_state(result, requested_mode, None));
+        let exit_code = metadata_exit_code_i32(result);
         let pid = result.pointer("/metadata/pid").and_then(Value::as_i64);
         let started_at = result
             .pointer("/metadata/startedAt")
@@ -231,9 +226,6 @@ impl<H: SessionHost> SessionMcpHandler<H> {
             description,
             total_output,
         };
-        if mode == "list" {
-            return None;
-        }
         if tracking_scope == "remote" {
             return None;
         }
@@ -252,6 +244,70 @@ impl<H: SessionHost> SessionMcpHandler<H> {
             .upsert_session_exbash(&scope.session_id, input)
             .await
             .ok()
+    }
+
+    async fn remove_exbash_tracking(
+        &self,
+        scope: &CallScope,
+        async_id: &str,
+        executor: &str,
+    ) -> Result<Value, JsonRpcError> {
+        let local_removed = self
+            .host
+            .remove_session_exbash(&scope.session_id, async_id, executor)
+            .await
+            .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+        let workspace_removed = self
+            .host
+            .remove_workdir_exbash(&scope.session_id, &scope.workdir, async_id, executor)
+            .await
+            .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+        Ok(json!({
+            "asyncID": async_id,
+            "executor": executor,
+            "localRemoved": local_removed,
+            "workspaceRemoved": workspace_removed,
+        }))
+    }
+
+    async fn update_existing_exbash_tracking(
+        &self,
+        scope: &CallScope,
+        result: &serde_json::Value,
+        mode: &str,
+        async_id: &str,
+        executor: &str,
+    ) -> Result<Vec<ExbashTaskSnapshot>, JsonRpcError> {
+        let mut snapshots = Vec::new();
+        if let Some(existing) = self
+            .host
+            .session_exbash_snapshot(&scope.session_id, async_id, executor)
+            .await
+            .map_err(|err| JsonRpcError::internal(err.to_string()))?
+        {
+            let input = exbash_sync_input_from_existing(&existing, result, mode);
+            snapshots.push(
+                self.host
+                    .upsert_session_exbash(&scope.session_id, input)
+                    .await
+                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
+            );
+        }
+        if let Some(existing) = self
+            .host
+            .workdir_exbash_snapshot(&scope.session_id, &scope.workdir, async_id, executor)
+            .await
+            .map_err(|err| JsonRpcError::internal(err.to_string()))?
+        {
+            let input = exbash_sync_input_from_existing(&existing, result, mode);
+            snapshots.push(
+                self.host
+                    .upsert_workdir_exbash(&scope.session_id, &scope.workdir, input)
+                    .await
+                    .map_err(|err| JsonRpcError::internal(err.to_string()))?,
+            );
+        }
+        Ok(snapshots)
     }
 
     async fn call_via_manager(
@@ -522,6 +578,162 @@ fn exbash_mode_creates_task(mode: &str) -> bool {
     matches!(mode, "run" | "shell")
 }
 
+fn exbash_error_indicates_missing_or_lost(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("async run not found")
+        || message.contains("not found")
+        || message.contains("does not exist")
+        || message.contains("closed before responding")
+        || message.contains("connection")
+        || message.contains("disconnected")
+        || message.contains("timed out")
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn exbash_result_async_id(value: &Value) -> Option<&str> {
+    value.pointer("/metadata/asyncID").and_then(Value::as_str)
+}
+
+fn exbash_result_executor(value: &Value) -> Option<&str> {
+    value.pointer("/metadata/executor").and_then(Value::as_str)
+}
+
+fn metadata_string(value: &Value, field: &str) -> Option<String> {
+    value
+        .get("metadata")
+        .and_then(|metadata| metadata.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn metadata_i64(value: &Value, field: &str) -> Option<i64> {
+    value
+        .get("metadata")
+        .and_then(|metadata| metadata.get(field))
+        .and_then(Value::as_i64)
+}
+
+fn metadata_exit_code_i32(value: &Value) -> Option<i32> {
+    let exit_code = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("exitCode"))?;
+    exit_code
+        .as_i64()
+        .map(|number| number as i32)
+        .or_else(|| exit_code.as_str()?.parse::<i32>().ok())
+}
+
+fn normalized_exit_state(exit_code: &Value) -> Option<String> {
+    if let Some(number) = exit_code.as_i64() {
+        return Some(format!("exit:{number}"));
+    }
+    let text = exit_code.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    match text {
+        "timeout" => Some("timeout".to_string()),
+        "stopped" | "stop" => Some("stop".to_string()),
+        other => other
+            .parse::<i32>()
+            .map(|number| format!("exit:{number}"))
+            .ok(),
+    }
+}
+
+fn normalize_exbash_state_for_host(state: &str, exit_code: Option<i32>) -> Option<String> {
+    match state.trim() {
+        "running" | "timeout" | "stop" => Some(state.trim().to_string()),
+        value if value.starts_with("exit:") => Some(value.to_string()),
+        "stopped" => Some(
+            exit_code
+                .map(|code| format!("exit:{code}"))
+                .unwrap_or_else(|| "stop".to_string()),
+        ),
+        "" => exit_code.map(|code| format!("exit:{code}")),
+        _ => None,
+    }
+}
+
+fn normalize_exbash_state_for_display(state: &str, exit_code: Option<i32>) -> String {
+    if state == "unknown" {
+        return "unknown".to_string();
+    }
+    normalize_exbash_state_for_host(state, exit_code).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn normalized_exbash_state(result: &Value, mode: &str, fallback: Option<&str>) -> String {
+    if let Some(state) = result
+        .get("metadata")
+        .and_then(|metadata| metadata.get("exitCode"))
+        .and_then(normalized_exit_state)
+    {
+        return state;
+    }
+    if mode == "stop" {
+        return "stop".to_string();
+    }
+    if let Some(state) = metadata_string(result, "state") {
+        if let Some(state) = normalize_exbash_state_for_host(&state, metadata_exit_code_i32(result))
+        {
+            return state;
+        }
+    }
+    if matches!(mode, "run" | "shell") && exbash_result_async_id(result).is_some() {
+        return "running".to_string();
+    }
+    fallback
+        .and_then(|state| normalize_exbash_state_for_host(state, metadata_exit_code_i32(result)))
+        .unwrap_or_else(|| "running".to_string())
+}
+
+fn set_metadata_field(value: &mut Value, field: &str, data: Value) {
+    if !value.get("metadata").map(Value::is_object).unwrap_or(false) {
+        value["metadata"] = json!({});
+    }
+    if let Some(metadata) = value.get_mut("metadata").and_then(Value::as_object_mut) {
+        metadata.insert(field.to_string(), data);
+    }
+}
+
+fn exbash_sync_input_from_existing(
+    existing: &ExbashTaskSnapshot,
+    result: &Value,
+    mode: &str,
+) -> ExbashSyncInput {
+    ExbashSyncInput {
+        async_id: Some(existing.async_id.clone()),
+        session_id: existing.session_id.clone(),
+        workdir: existing.workdir.clone(),
+        executor: Some(existing.executor.clone()),
+        state: Some(normalized_exbash_state(
+            result,
+            mode,
+            existing.state.as_deref(),
+        )),
+        pid: metadata_i64(result, "pid").or(existing.pid),
+        exit_code: metadata_exit_code_i32(result).or(existing.exit_code),
+        started_at: metadata_i64(result, "startedAt").or(existing.started_at),
+        ended_at: metadata_i64(result, "endedAt").or_else(|| {
+            if mode == "stop" {
+                Some(now_ms())
+            } else {
+                existing.ended_at
+            }
+        }),
+        command: metadata_string(result, "command").or_else(|| existing.command.clone()),
+        description: metadata_string(result, "description")
+            .or_else(|| existing.description.clone()),
+        total_output: metadata_i64(result, "totalOutput").or(existing.total_output),
+    }
+}
+
 fn extract_rg_mode(arguments: &Value) -> Result<RgMode, JsonRpcError> {
     let mode = optional_string_field(arguments, "mode")
         .or_else(|| optional_string_field(arguments, "type"))
@@ -575,16 +787,20 @@ fn remote_exbash_runs(value: &Value) -> Vec<Value> {
 }
 
 fn format_exbash_task(task: &ExbashTaskSnapshot) -> String {
-    let state = task.state.as_deref().unwrap_or("unknown");
-    let exit = task
-        .exit_code
-        .map(|code| format!(" exit={code}"))
-        .unwrap_or_default();
+    let state = task
+        .state
+        .as_deref()
+        .map(|state| normalize_exbash_state_for_display(state, task.exit_code))
+        .unwrap_or_else(|| {
+            task.exit_code
+                .map(|code| format!("exit:{code}"))
+                .unwrap_or_else(|| "unknown".to_string())
+        });
     let total_output = task.total_output.unwrap_or_default();
     let command = task.command.as_deref().unwrap_or("");
     format!(
-        "- {}:{} {}{} totalOutput={} command={}",
-        task.executor, task.async_id, state, exit, total_output, command
+        "- {}:{} {} totalOutput={} command={}",
+        task.executor, task.async_id, state, total_output, command
     )
 }
 
@@ -593,20 +809,21 @@ fn format_remote_exbash_run(run: &Value) -> String {
         .get("asyncID")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let state = run
-        .get("state")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let exit = run
-        .get("exitCode")
-        .map(|code| format!(" exit={}", json_value_text(code)))
-        .unwrap_or_default();
+    let exit_code = run.get("exitCode");
+    let state = exit_code
+        .and_then(normalized_exit_state)
+        .or_else(|| {
+            run.get("state")
+                .and_then(Value::as_str)
+                .map(|state| normalize_exbash_state_for_display(state, None))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     let total_output = run
         .get("totalOutput")
         .map(json_value_text)
         .unwrap_or_else(|| "0".to_string());
     let command = run.get("command").and_then(Value::as_str).unwrap_or("");
-    format!("- {async_id} {state}{exit} totalOutput={total_output} command={command}")
+    format!("- {async_id} {state} totalOutput={total_output} command={command}")
 }
 
 fn format_exbash_run_or_shell_output(result: &Value) -> String {
@@ -824,18 +1041,63 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                         object.insert("mode".to_string(), Value::String(mode.clone()));
                     }
                 }
+                let requested_async_id = optional_string_field(&call_args, "asyncID");
+                let requested_executor = optional_string_field(&call_args, "executor")
+                    .or_else(|| optional_string_field(&call_args, "targetExecutor"))
+                    .unwrap_or_else(|| "local".to_string());
                 self.check_exbash_create_allowed(&scope, &tracking_scope, &call_args)
                     .await?;
                 remove_field(&mut call_args, "scope");
                 remove_field(&mut call_args, "spoe");
-                let result = self.call_via_manager(&scope, "exbash", call_args).await?;
+                let result = match self.call_via_manager(&scope, "exbash", call_args).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        if mode == "remove"
+                            && requested_executor == "local"
+                            && exbash_error_indicates_missing_or_lost(&error.message)
+                        {
+                            if let Some(async_id) = requested_async_id.as_deref() {
+                                self.remove_exbash_tracking(&scope, async_id, &requested_executor)
+                                    .await?;
+                            }
+                        }
+                        return Err(error);
+                    }
+                };
                 let mut value = result;
                 if let Some(snapshot) = self
-                    .upsert_exbash_from_result(&scope, &value, &tracking_scope)
+                    .upsert_exbash_from_result(&scope, &value, &tracking_scope, &mode)
                     .await
                 {
                     value["metadata"]["hostSnapshot"] =
                         serde_json::to_value(snapshot).unwrap_or_default();
+                } else if let Some(async_id) =
+                    exbash_result_async_id(&value).or(requested_async_id.as_deref())
+                {
+                    let executor = exbash_result_executor(&value)
+                        .or(Some(requested_executor.as_str()))
+                        .unwrap_or("local");
+                    if mode == "remove" {
+                        if value.pointer("/metadata/hostCleanup").is_none() {
+                            let cleanup = self
+                                .remove_exbash_tracking(&scope, async_id, executor)
+                                .await?;
+                            set_metadata_field(&mut value, "hostCleanup", cleanup);
+                        }
+                    } else if matches!(mode.as_str(), "stop" | "attach") {
+                        let snapshots = self
+                            .update_existing_exbash_tracking(
+                                &scope, &value, &mode, async_id, executor,
+                            )
+                            .await?;
+                        if !snapshots.is_empty() {
+                            set_metadata_field(
+                                &mut value,
+                                "hostSnapshots",
+                                serde_json::to_value(snapshots).unwrap_or_default(),
+                            );
+                        }
+                    }
                 }
                 let output_text = if mode == "run" || mode == "shell" {
                     format_exbash_run_or_shell_output(&value)

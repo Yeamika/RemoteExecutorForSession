@@ -835,6 +835,240 @@ async fn exbash_plaintext_exitcode_defaults_and_list_scope() {
 }
 
 #[tokio::test]
+async fn exbash_cleanup_syncs_host_tracking() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_exbash_cleanup",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host.clone(),
+        shared_manager.clone(),
+        shell_manager,
+    ));
+
+    let local = call_structured(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"run","command":"sleep 20","read_timeout":10}),
+    )
+    .await;
+    assert!(
+        local["error"].is_null(),
+        "local detached run failed: {:?}",
+        local["error"]
+    );
+    let local_async_id = meta(&local)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let remove = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"remove","asyncID":local_async_id}),
+    )
+    .await;
+    assert!(
+        remove["error"].is_null(),
+        "local remove failed: {:?}",
+        remove["error"]
+    );
+    let list = call(&ep, "ses_exbash_cleanup", "exbash", json!({"mode":"list"})).await;
+    let list_text = text(&list);
+    assert!(
+        list_text.contains("local:0 workspace:0") && !list_text.contains(&local_async_id),
+        "local remove should clear host tracking, got: {:?}",
+        list_text
+    );
+
+    let workspace = call_structured(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"run","scope":"workspace","command":"sleep 20","read_timeout":10}),
+    )
+    .await;
+    assert!(
+        workspace["error"].is_null(),
+        "workspace detached run failed: {:?}",
+        workspace["error"]
+    );
+    let workspace_async_id = meta(&workspace)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let stop = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"stop","asyncID":workspace_async_id}),
+    )
+    .await;
+    assert!(
+        stop["error"].is_null(),
+        "workspace stop without scope failed: {:?}",
+        stop["error"]
+    );
+    let local_list = call(&ep, "ses_exbash_cleanup", "exbash", json!({"mode":"list"})).await;
+    let local_list_text = text(&local_list);
+    assert!(
+        local_list_text.contains("local:0 workspace:1"),
+        "stop without scope must not create local tracking, got: {:?}",
+        local_list_text
+    );
+    let workspace_list = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"list","scope":"workspace"}),
+    )
+    .await;
+    let workspace_list_text = text(&workspace_list);
+    assert!(
+        workspace_list_text.contains(&workspace_async_id) && workspace_list_text.contains("stop"),
+        "workspace stop should mark existing workspace tracking stopped as stop, got: {:?}",
+        workspace_list_text
+    );
+
+    let remove = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"remove","asyncID":workspace_async_id}),
+    )
+    .await;
+    assert!(
+        remove["error"].is_null(),
+        "workspace remove without scope failed: {:?}",
+        remove["error"]
+    );
+    let workspace_list = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"list","scope":"workspace"}),
+    )
+    .await;
+    let workspace_list_text = text(&workspace_list);
+    assert!(
+        workspace_list_text.contains("local:0 workspace:0")
+            && !workspace_list_text.contains(&workspace_async_id),
+        "workspace remove should clear host tracking, got: {:?}",
+        workspace_list_text
+    );
+
+    let stale = call_structured(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"run","scope":"workspace","command":"sleep 20","read_timeout":10}),
+    )
+    .await;
+    assert!(
+        stale["error"].is_null(),
+        "stale source run failed: {:?}",
+        stale["error"]
+    );
+    let stale_async_id = meta(&stale)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let workspace_list = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"list","scope":"workspace"}),
+    )
+    .await;
+    assert!(
+        text(&workspace_list).contains(&stale_async_id),
+        "source workspace tracking missing before stale cleanup"
+    );
+
+    let other_host = Arc::new(MemorySessionHost::new(
+        "ses_exbash_cleanup_other",
+        dir.path().to_string_lossy(),
+    ));
+    let other_ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let other_ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        other_ctx,
+        other_host,
+        shared_manager,
+        ShellManager::default_shell(80, 24),
+    ));
+    let external_remove = call(
+        &other_ep,
+        "ses_exbash_cleanup_other",
+        "exbash",
+        json!({"mode":"remove","asyncID":stale_async_id}),
+    )
+    .await;
+    assert!(
+        external_remove["error"].is_null(),
+        "second MCP remove failed: {:?}",
+        external_remove["error"]
+    );
+    let workspace_list = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"list","scope":"workspace"}),
+    )
+    .await;
+    assert!(
+        text(&workspace_list).contains(&stale_async_id),
+        "source workspace tracking should remain stale before cleanup"
+    );
+
+    let remove = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"remove","asyncID":stale_async_id}),
+    )
+    .await;
+    assert!(
+        !remove["error"].is_null(),
+        "stale remove should return the executor error"
+    );
+    assert!(
+        remove["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("does not exist")
+            || remove["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not found"),
+        "stale remove should return notfound, got: {:?}",
+        remove["error"]
+    );
+    let workspace_list = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"list","scope":"workspace"}),
+    )
+    .await;
+    let workspace_list_text = text(&workspace_list);
+    assert!(
+        workspace_list_text.contains("local:0 workspace:0")
+            && !workspace_list_text.contains(&stale_async_id),
+        "stale remove should clear host tracking through MCP, got: {:?}",
+        workspace_list_text
+    );
+}
+
+#[tokio::test]
 async fn manager_list_shells_routes_through_executor() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);

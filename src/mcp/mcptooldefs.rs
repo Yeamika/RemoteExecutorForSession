@@ -1059,7 +1059,7 @@ pub fn exbash() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "{\n  \"default\": \"auto\",\n  \"interactive\": \"auto\",\n  \"profiles\": {\n    \"bash\": {\n      \"candidates\": [\n        \"bash\"\n      ],\n      \"commandArgs\": [\n        \"-lc\",\n        \"{command}\"\n      ],\n      \"interactiveArgs\": [\n        \"-i\"\n      ]\n    }\n  },\n  \"settingsPath\": \"/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\"\n}"
+///         "text": "default:auto\ninteractive:auto\nsettingsPath:/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\nprofiles:\n- bash: candidates=.venv/bin/bash bash /bin/bash sh commandArgs=-lc {command} interactiveArgs=-l\n- node: candidates=node nodejs commandArgs=-e {command} interactiveArgs=<none>\n- powershell: candidates=pwsh powershell.exe commandArgs=-NoLogo -NoProfile -NonInteractive -Command {command} interactiveArgs=-NoLogo\n- python: candidates=.venv/bin/python .venv/Scripts/python.exe venv/bin/python venv/Scripts/python.exe python3 python commandArgs=-c {command} interactiveArgs=<none>"
 ///       }
 ///     ],
 ///     "structuredContent": {
@@ -1069,15 +1069,60 @@ pub fn exbash() -> McpToolDef {
 ///         "profiles": {
 ///           "bash": {
 ///             "candidates": [
-///               "bash"
+///               ".venv/bin/bash",
+///               "bash",
+///               "/bin/bash",
+///               "sh"
 ///             ],
 ///             "commandArgs": [
 ///               "-lc",
 ///               "{command}"
 ///             ],
 ///             "interactiveArgs": [
-///               "-i"
+///               "-l"
 ///             ]
+///           },
+///           "node": {
+///             "candidates": [
+///               "node",
+///               "nodejs"
+///             ],
+///             "commandArgs": [
+///               "-e",
+///               "{command}"
+///             ],
+///             "interactiveArgs": []
+///           },
+///           "powershell": {
+///             "candidates": [
+///               "pwsh",
+///               "powershell.exe"
+///             ],
+///             "commandArgs": [
+///               "-NoLogo",
+///               "-NoProfile",
+///               "-NonInteractive",
+///               "-Command",
+///               "{command}"
+///             ],
+///             "interactiveArgs": [
+///               "-NoLogo"
+///             ]
+///           },
+///           "python": {
+///             "candidates": [
+///               ".venv/bin/python",
+///               ".venv/Scripts/python.exe",
+///               "venv/bin/python",
+///               "venv/Scripts/python.exe",
+///               "python3",
+///               "python"
+///             ],
+///             "commandArgs": [
+///               "-c",
+///               "{command}"
+///             ],
+///             "interactiveArgs": []
 ///           }
 ///         },
 ///         "settingsPath": "/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
@@ -1114,29 +1159,24 @@ pub fn exbash() -> McpToolDef {
 ///     "content": [
 ///       {
 ///         "type": "text",
-///         "text": "{\n  \"defaultShell\": \"auto\",\n  \"resolution\": {\n    \"requested\": \"auto\",\n    \"profile\": \"bash\",\n    \"program\": \"bash\",\n    \"args\": [\n      \"-lc\",\n      \"\"\n    ],\n    \"settingsPath\": \"/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\"\n  },\n  \"settingsPath\": \"/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\"\n}"
+///         "text": "defaultShell:auto\nsettingsPath:/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json\nresolution: requested=auto profile=bash program=bash args=-lc <empty> settingsPath=/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
 ///       }
 ///     ],
 ///     "structuredContent": {
-///       "id": 1,
-///       "ok": true,
-///       "result": {
-///         "metadata": {
-///           "defaultShell": "auto",
-///           "resolution": {
-///             "requested": "auto",
-///             "profile": "bash",
-///             "program": "bash",
-///             "args": [
-///               "-lc",
-///               ""
-///             ],
-///             "settingsPath": "/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
-///           },
+///       "metadata": {
+///         "defaultShell": "auto",
+///         "resolution": {
+///           "requested": "auto",
+///           "profile": "bash",
+///           "program": "bash",
+///           "args": [
+///             "-lc",
+///             ""
+///           ],
 ///           "settingsPath": "/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
-///         }
-///       },
-///       "executor": "local"
+///         },
+///         "settingsPath": "/workspace/OSG-Project/RemoteExecutorForSession/.re-setting.json"
+///       }
 ///     }
 ///   }
 /// }

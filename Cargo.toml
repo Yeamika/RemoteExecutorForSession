@@ -6,7 +6,7 @@ description = "Session-aware Rust SDK wrapper around the RemoteExecutor library 
 publish = false
 
 [dependencies]
-remote_executor = { git = "https://github.com/Yeamika/RemoteExecutor.git", rev = "aefa129bff96d69d45225b32b0a4e3d653884e65" }
+remote_executor = { git = "https://github.com/Yeamika/RemoteExecutor.git", branch = "main" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

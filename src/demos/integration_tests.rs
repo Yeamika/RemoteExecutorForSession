@@ -746,8 +746,11 @@ async fn manager_list_shells_routes_through_executor() {
     );
     let output = text(&response);
     assert!(
-        output.contains("\"default\"") && output.contains("\"profiles\""),
-        "list_shells output should contain shell settings JSON, got: {:?}",
+        output.starts_with("default:")
+            && output.contains("\ninteractive:")
+            && output.contains("\nsettingsPath:")
+            && output.contains("\nprofiles:\n- "),
+        "list_shells output should contain plaintext shell settings, got: {:?}",
         output
     );
     assert!(meta(&response)["metadata"]["profiles"].is_object());

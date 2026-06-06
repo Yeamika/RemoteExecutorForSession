@@ -902,9 +902,15 @@ fn format_exbash_task(task: &ExbashTaskSnapshot) -> String {
         });
     let total_output = task.total_output.unwrap_or_default();
     let command = task.command.as_deref().unwrap_or("");
+    let description = task.description.as_deref().unwrap_or("");
     format!(
-        "- {}:{} {} totalOutput={} command={}",
-        task.executor, task.async_id, state, total_output, command
+        "- {}:{} {} totalOutput={} description={} command={}",
+        task.executor,
+        task.async_id,
+        state,
+        total_output,
+        single_line_exbash_list_text(description),
+        clipped_exbash_list_command(command)
     )
 }
 
@@ -927,7 +933,70 @@ fn format_remote_exbash_run(run: &Value) -> String {
         .map(json_value_text)
         .unwrap_or_else(|| "0".to_string());
     let command = run.get("command").and_then(Value::as_str).unwrap_or("");
-    format!("- {async_id} {state} totalOutput={total_output} command={command}")
+    let description = run.get("description").and_then(Value::as_str).unwrap_or("");
+    let description = single_line_exbash_list_text(description);
+    let command = clipped_exbash_list_command(command);
+    format!(
+        "- {async_id} {state} totalOutput={total_output} description={description} command={command}"
+    )
+}
+
+fn clipped_exbash_list_command(command: &str) -> String {
+    single_line_exbash_list_text(command)
+        .chars()
+        .take(30)
+        .collect()
+}
+
+fn single_line_exbash_list_text(text: &str) -> String {
+    text.replace("\r\n", "\\n")
+        .replace('\n', "\\n")
+        .replace('\r', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exbash_task_list_line_keeps_description_and_clips_command() {
+        let line = format_exbash_task(&ExbashTaskSnapshot {
+            async_id: "rex-test".to_string(),
+            executor: "local".to_string(),
+            session_id: Some("session".to_string()),
+            workdir: None,
+            state: Some("running".to_string()),
+            pid: None,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+            command: Some("012345678901234567890123456789EXTRA\nnext".to_string()),
+            description: Some("full description\nwith newline".to_string()),
+            total_output: Some(12),
+        });
+
+        assert!(line.contains(
+            "totalOutput=12 description=full description\\nwith newline command=012345678901234567890123456789"
+        ));
+        assert!(!line.contains("EXTRA"));
+        assert!(!line.contains("description=full description\nwith newline"));
+    }
+
+    #[test]
+    fn remote_exbash_list_line_keeps_description_and_clips_command() {
+        let line = format_remote_exbash_run(&serde_json::json!({
+            "asyncID": "rex-remote",
+            "state": "running",
+            "totalOutput": 8,
+            "description": "remote description\nwith newline",
+            "command": "abcdefghijklmnopqrstuvwxyz123456EXTRA"
+        }));
+
+        assert_eq!(
+            line,
+            "- rex-remote running totalOutput=8 description=remote description\\nwith newline command=abcdefghijklmnopqrstuvwxyz1234"
+        );
+    }
 }
 
 fn format_exbash_run_or_shell_output(result: &Value) -> String {

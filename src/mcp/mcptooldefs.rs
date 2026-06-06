@@ -902,12 +902,12 @@ pub fn rg() -> McpToolDef {
 ///         "type": "text",
 ///         "text": "local:6 workspace:0
 /// showing executor=local of local
-/// - local:doc-running running totalOutput=0 command=sleep 30
-/// - local:doc-exit0 exit:0 totalOutput=13 command=echo all-good
-/// - local:doc-exit7 exit:7 totalOutput=0 command=false
-/// - local:doc-timeout timeout totalOutput=0 command=sleep 60
-/// - local:doc-stop stop totalOutput=0 command=sleep 60
-/// - local:doc-unknown2 unknown totalOutput=0 command=persisted abnormal state"
+/// - local:doc-running running totalOutput=0 description=long-running doc task command=sleep 30
+/// - local:doc-exit0 exit:0 totalOutput=13 description=finished successfully command=echo all-good
+/// - local:doc-exit7 exit:7 totalOutput=0 description=failed command=false
+/// - local:doc-timeout timeout totalOutput=0 description=timed out command=sleep 60
+/// - local:doc-stop stop totalOutput=0 description=stopped by user command=sleep 60
+/// - local:doc-unknown2 unknown totalOutput=0 description=persisted abnormal state command=persisted abnormal state"
 ///       }
 ///     ]
 ///   }
@@ -942,7 +942,7 @@ pub fn rg() -> McpToolDef {
 ///         "type": "text",
 ///         "text": "local:0 workspace:1
 /// showing executor=all of workspace
-/// - local:rex-1780668735154-6 running totalOutput=0 command=sleep 5"
+/// - local:rex-1780668735154-6 running totalOutput=0 description=workspace smoke command=sleep 5"
 ///       }
 ///     ]
 ///   }
@@ -978,10 +978,10 @@ pub fn rg() -> McpToolDef {
 ///         "type": "text",
 ///         "text": "local:0 workspace:0
 /// showing executor=exec_1 of remote
-/// - rex-1780669216537-1 running totalOutput=0 command=sleep 5
-/// - rex-1780669216551-2 exit:0 totalOutput=13 command=bash -lc sleep 0.1; echo remote-done
-/// - rex-1780669216565-3 timeout totalOutput=0 command=sleep 5
-/// - rex-1780669216579-4 stop totalOutput=0 command=sleep 5"
+/// - rex-1780669216537-1 running totalOutput=0 description=remote running command=sleep 5
+/// - rex-1780669216551-2 exit:0 totalOutput=13 description=remote completed command=bash -lc sleep 0.1; echo remot
+/// - rex-1780669216565-3 timeout totalOutput=0 description=remote timeout command=sleep 5
+/// - rex-1780669216579-4 stop totalOutput=0 description=remote stopped command=sleep 5"
 ///       }
 ///     ]
 ///   }
@@ -1030,7 +1030,7 @@ pub fn exbash() -> McpToolDef {
             prop("timeout", integer_prop("Total lifetime timeout in milliseconds. Omit, 0, or -1 to leave the run unmanaged.")),
             prop("read_timeout", integer_prop("How long to wait before returning. If the process is still running at timeout, the tool returns a detached snapshot with `asyncID`.")),
             prop("asyncID", string_prop("Run id returned by detached `run` or `shell`; required for `attach`, `stop`, and `remove`.")),
-            prop("text", string_prop("Text to write to PTY stdin in `attach` mode. Common escape sequences are interpreted.")),
+            prop("text", string_prop("Text to write to PTY stdin in `attach` mode. Escape sequences are decoded before writing; use `\\n` for Enter/newline and `\\u0003` for Ctrl-C/control bytes.")),
             prop("filePath", string_prop("File path for `attach` mode input. Mutually exclusive with `text`.")),
             prop("workdir", string_prop("Working directory for `run` and `shell` commands.")),
             prop("showRawPretty", boolean_prop("Include raw PTY text in attach metadata.")),

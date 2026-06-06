@@ -15,7 +15,6 @@ type Key = String;
 
 #[derive(Clone)]
 pub struct MemorySessionHost {
-    session_id: String,
     workdir: String,
     session_workdirs: Arc<RwLock<HashMap<String, String>>>,
     hash_refs: Arc<RwLock<HashMap<Key, FileRefEntry>>>,
@@ -32,7 +31,6 @@ impl MemorySessionHost {
         let mut session_workdirs = HashMap::new();
         session_workdirs.insert(session_id.clone(), workdir.clone());
         Self {
-            session_id,
             workdir,
             session_workdirs: Arc::new(RwLock::new(session_workdirs)),
             hash_refs: Arc::new(RwLock::new(HashMap::new())),

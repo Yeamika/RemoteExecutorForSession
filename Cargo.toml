@@ -8,14 +8,20 @@ publish = false
 [dependencies]
 remote_executor = { git = "https://github.com/Yeamika/RemoteExecutor.git", branch = "main" }
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"
 sha1 = "0.10"
 async-trait = "0.1"
 futures-util = "0.3"
-tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread"] }
+pty_t_protocol = { git = "https://github.com/Yeamika/RemoteExecutor.git", branch = "main" }
+rand = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.29"
 tempfile = "3"
+vt100 = "0.16"
 
 [dev-dependencies]
 
@@ -26,3 +32,11 @@ path = "src/bin/rec_mcp_demo.rs"
 [[bin]]
 name = "rec_mcp_memory_server"
 path = "src/bin/rec_mcp_memory_server.rs"
+
+[[bin]]
+name = "rec_mcp_memory_ws_server"
+path = "src/bin/rec_mcp_memory_ws_server.rs"
+
+[[bin]]
+name = "refs-ptyt"
+path = "src/bin/refs_ptyt.rs"

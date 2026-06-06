@@ -6,17 +6,6 @@ use remote_executor_for_session::rec::{new_manager, ShellManager, ToolContext};
 use serde_json::json;
 use std::sync::Arc;
 
-fn file_ref(text: &str) -> String {
-    text.lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("<fileRef>")
-                .and_then(|value| value.strip_suffix("</fileRef>"))
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
-}
-
 #[tokio::main]
 async fn main() {
     let caller = new_manager().await.unwrap();

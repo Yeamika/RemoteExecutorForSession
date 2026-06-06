@@ -632,6 +632,27 @@ fn optional_string_field(value: &Value, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn require_patch_hash_ref(arguments: &Value) -> Result<(), JsonRpcError> {
+    if optional_string_field(arguments, "mode").as_deref() != Some("patch") {
+        return Ok(());
+    }
+    let file_key = optional_string_field(arguments, "fileKey").unwrap_or_default();
+    if parse_hash_ref(&file_key).is_some() {
+        return Ok(());
+    }
+    Err(JsonRpcError::invalid_params(
+        "FileAction mode=patch requires fileKey to be a hashRef returned by read/FileAction, such as `App.ts #A1B2`; call read first and pass the <fileRef> value.",
+    ))
+}
+
+fn enable_hash_check_mode(arguments: &mut Value) {
+    if let Some(object) = arguments.as_object_mut() {
+        object
+            .entry("hashCheckMode".to_string())
+            .or_insert(Value::Bool(true));
+    }
+}
+
 fn extract_exbash_scope(arguments: &Value) -> Result<String, JsonRpcError> {
     let scope = optional_string_field(arguments, "scope")
         .or_else(|| optional_string_field(arguments, "spoe"))
@@ -1067,8 +1088,14 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 } else {
                     None
                 };
+                if name == "FileAction" {
+                    require_patch_hash_ref(&arguments)?;
+                }
                 // Resolve hashRef if present
-                let (args, file_key_ref) = self.resolve_file_args(&scope, arguments).await?;
+                let (mut args, file_key_ref) = self.resolve_file_args(&scope, arguments).await?;
+                if name == "read" {
+                    enable_hash_check_mode(&mut args);
+                }
                 let executor = extract_executor_from_value(&args);
                 // Call via Caller
                 let result = self.call_via_manager(&scope, name, args).await?;

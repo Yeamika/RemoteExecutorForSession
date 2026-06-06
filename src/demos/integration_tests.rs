@@ -422,13 +422,10 @@ async fn run_session(
             }
             Action::Patch { file_idx } => {
                 let file_executor = file_executors[*file_idx].unwrap_or(executor);
-                let key = file_refs[*file_idx].clone()
-                    .or_else(|| file_paths[*file_idx].as_ref().map(|p| p.to_string_lossy().to_string()))
-                    .unwrap_or_default();
-                if key.is_empty() {
+                let Some(key) = file_refs[*file_idx].clone() else {
                     pty_skipped += 1;
                     continue;
-                }
+                };
                 call(ep, &session_id, "FileAction", json!({"mode":"patch","fileKey":key,"patchText":"insert -1\n+// patched\n","executor":file_executor})).await
             }
             Action::Rename { file_idx, new_name } => {
@@ -1744,6 +1741,83 @@ async fn manager_list_shells_routes_through_executor() {
     assert!(
         response["result"]["structuredContent"].is_null(),
         "structuredContent should be omitted by default"
+    );
+}
+
+#[tokio::test]
+async fn file_action_patch_requires_hash_ref() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("patch_requires_hash_ref.txt");
+    std::fs::write(&file, "base\n").unwrap();
+
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_patch_hash_ref",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let rejected = call(
+        &ep,
+        "ses_patch_hash_ref",
+        "FileAction",
+        json!({
+            "mode": "patch",
+            "fileKey": file.to_string_lossy(),
+            "patchText": "@@ -1 +1,2 @@\n base\n+direct should not write\n",
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], json!(-32602));
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("requires fileKey to be a hashRef"),
+        "direct patch should explain hashRef requirement: {rejected:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "base\n");
+
+    let read = call(
+        &ep,
+        "ses_patch_hash_ref",
+        "read",
+        json!({"fileKey": file.to_string_lossy(), "executor": "local"}),
+    )
+    .await;
+    assert!(read["error"].is_null(), "read failed: {:?}", read["error"]);
+    let file_ref = file_ref_from_text(&text(&read))
+        .unwrap_or_else(|| panic!("read did not return fileRef: {read:?}"));
+
+    let patched = call(
+        &ep,
+        "ses_patch_hash_ref",
+        "FileAction",
+        json!({
+            "mode": "patch",
+            "fileKey": file_ref,
+            "patchText": "@@ -1 +1,2 @@\n base\n+hashRef write\n",
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert!(
+        patched["error"].is_null(),
+        "hashRef patch failed: {:?}",
+        patched["error"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "base\nhashRef write\n"
     );
 }
 

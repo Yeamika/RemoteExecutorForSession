@@ -278,7 +278,7 @@ fn tool_def(
 pub fn file_action() -> McpToolDef {
     tool_def(
         "FileAction",
-        "REC file action: patch, create, delete, or rename a file. For stale-safe edits, prefer the hashRef label returned by read/FileAction, e.g. `App.ts #A1B2`, as `fileKey`; this resolves the file and applies hash checking before the mutation.",
+        "REC file action: patch, create, delete, or rename a file. mode=patch requires the hashRef label returned by read/FileAction, e.g. `App.ts #A1B2`, as `fileKey`; call read first and pass the `<fileRef>...</fileRef>` value. The hashRef resolves the file and applies hash checking before mutation.",
         vec!["mode"],
         vec![
             exec_session_prop(),
@@ -289,7 +289,7 @@ pub fn file_action() -> McpToolDef {
             ),
             prop(
                 "fileKey",
-                string_prop("Direct path, REC file key, or hashRef label. If tool output contains `<fileRef>App.ts #A1B2</fileRef>`, pass the inner `App.ts #A1B2` value here."),
+                string_prop("mode=patch: required hashRef label such as `App.ts #A1B2` from `<fileRef>...</fileRef>`. Other modes may use a direct path, REC file key, or hashRef label."),
             ),
             prop(
                 "newFilePath",
@@ -418,7 +418,7 @@ pub fn file_action() -> McpToolDef {
 pub fn read() -> McpToolDef {
     tool_def(
         "read",
-        "Read a file via REC. Accepts direct paths, REC file keys, and hashRef labels such as `filename #ABCD`. File reads may return `<fileRef>filename #ABCD</fileRef>`; use that inner label as `fileKey` for later read/FileAction calls to preserve file identity and hash safety.",
+        "Read a file via REC. Accepts direct paths, REC file keys, and hashRef labels such as `filename #ABCD`. File reads return `<fileRef>filename #ABCD</fileRef>` for files by default; use that inner label as `fileKey` for later read/FileAction patch calls.",
         vec!["fileKey"],
         vec![
             exec_session_prop(),

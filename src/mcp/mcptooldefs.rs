@@ -278,7 +278,18 @@ fn tool_def(
 pub fn file_action() -> McpToolDef {
     tool_def(
         "FileAction",
-        "REC file action: patch, create, delete, or rename a file. mode=patch requires the hashRef label returned by read/FileAction, e.g. `App.ts #A1B2`, as `fileKey`; call read first and pass the `<fileRef>...</fileRef>` value. The hashRef resolves the file and applies hash checking before mutation.",
+        r#"REC file action: patch, create, delete, or rename a file. mode=patch requires the hashRef label returned by read/FileAction, e.g. `App.ts #A1B2`, as `fileKey`; call read first and pass the `<fileRef>...</fileRef>` value. The hashRef resolves the file and applies hash checking before mutation.
+
+Patch example:
+1. read returns `<fileRef>notes.txt #A1B2</fileRef>`
+2. call FileAction with `mode="patch"`, `fileKey="notes.txt #A1B2"`, and:
+```diff
+@@ -3,2 +3,2 @@
+-status: pending
+-message: replace this line
++status: success
++message: patch applied successfully
+```"#,
         vec!["mode"],
         vec![
             exec_session_prop(),
@@ -295,7 +306,12 @@ pub fn file_action() -> McpToolDef {
                 "newFilePath",
                 string_prop("Destination path for mode=rename"),
             ),
-            prop("patchText", string_prop("REC patch text for mode=patch")),
+            prop(
+                "patchText",
+                string_prop(
+                    "Patch text for mode=patch. Prefer a unified diff hunk starting with `@@`; use the hashRef label from read/FileAction as fileKey.",
+                ),
+            ),
             prop(
                 "content",
                 string_prop(
@@ -990,7 +1006,7 @@ pub fn rg() -> McpToolDef {
 pub fn exbash() -> McpToolDef {
     tool_def(
         "exbash",
-        "PTY-backed background terminal. `shell` is the default mode and should be used for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Remote executor tracking is lazy: stored state is updated only after a successful executor call; failed remote calls leave stored state unchanged.",
+        "PTY-backed background terminal. Use `shell` mode first for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Remote executor tracking is lazy: stored state is updated only after a successful executor call; failed remote calls leave stored state unchanged.",
         vec![],
         vec![
             exec_session_prop(),

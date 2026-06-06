@@ -163,7 +163,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         }
         let read_args =
             json!({ "filePath": file_path, "executor": executor, "hashCheckMode": true });
-        let Ok(read_result) = self.call_via_manager(scope, "read", read_args).await else {
+        let Ok(read_result) = self.call_executor_tool(scope, "read", read_args).await else {
             return result;
         };
         if let Some(hash_code) = read_result.pointer("/metadata/hashCode").cloned() {
@@ -380,7 +380,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         let _ = host.upsert_session_exbash(&scope.session_id, input).await;
     }
 
-    async fn call_via_manager(
+    async fn call_executor_tool(
         &self,
         scope: &CallScope,
         name: &str,
@@ -456,7 +456,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
                 ));
             }
             let remote = self
-                .call_via_manager(
+                .call_executor_tool(
                     scope,
                     "exbash",
                     json!({ "mode": "list", "executor": remote_executor }),
@@ -516,7 +516,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         let mut remote_untracked_count = None;
         if let Some(remote_executor) = executor_filter.as_deref().filter(|item| *item != "local") {
             if let Ok(remote) = self
-                .call_via_manager(
+                .call_executor_tool(
                     scope,
                     "exbash",
                     json!({ "mode": "list", "executor": remote_executor }),
@@ -1166,8 +1166,8 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     enable_hash_check_mode(&mut args);
                 }
                 let executor = extract_executor_from_value(&args);
-                // Call via Caller
-                let result = self.call_via_manager(&scope, name, args).await?;
+                // Dispatch through the executor manager.
+                let result = self.call_executor_tool(&scope, name, args).await?;
                 // FileAction results use patch-style file metadata. Read back changed files so
                 // hashRef storage gets a canonical REC FileStamp and the latest hash.
                 let result = if name == "FileAction" {
@@ -1238,7 +1238,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     .await?;
                 remove_field(&mut call_args, "scope");
                 remove_field(&mut call_args, "spoe");
-                let result = match self.call_via_manager(&scope, "exbash", call_args).await {
+                let result = match self.call_executor_tool(&scope, "exbash", call_args).await {
                     Ok(result) => result,
                     Err(error) => {
                         if mode == "remove"
@@ -1310,7 +1310,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 let mut call_args = arguments;
                 remove_field(&mut call_args, "mode");
                 remove_field(&mut call_args, "type");
-                let result = self.call_via_manager(&scope, method, call_args).await?;
+                let result = self.call_executor_tool(&scope, method, call_args).await?;
                 let result = match mode {
                     RgMode::Content => result,
                     RgMode::Files => normalize_rg_files_result(result),
@@ -1350,7 +1350,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                         "set_default_shell"
                     };
                     let result = self
-                        .call_via_manager(&scope, tool_method, call_args)
+                        .call_executor_tool(&scope, tool_method, call_args)
                         .await?;
                     let output_text = extract_output_text(&result);
                     return Ok(McpCallResult {

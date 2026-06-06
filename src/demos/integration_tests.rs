@@ -1798,6 +1798,39 @@ async fn file_action_patch_requires_hash_ref() {
     let file_ref = file_ref_from_text(&text(&read))
         .unwrap_or_else(|| panic!("read did not return fileRef: {read:?}"));
 
+    let invalid_patch = call(
+        &ep,
+        "ses_patch_hash_ref",
+        "FileAction",
+        json!({
+            "mode": "patch",
+            "fileKey": file_ref,
+            "patchText": "this is not a unified diff",
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert_eq!(invalid_patch["error"]["code"], json!(-32603));
+    assert!(
+        invalid_patch["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unified diff hunk"),
+        "invalid hashRef patch should explain hunk requirement: {invalid_patch:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "base\n");
+
+    let read = call(
+        &ep,
+        "ses_patch_hash_ref",
+        "read",
+        json!({"fileKey": file.to_string_lossy(), "executor": "local"}),
+    )
+    .await;
+    assert!(read["error"].is_null(), "read failed: {:?}", read["error"]);
+    let file_ref = file_ref_from_text(&text(&read))
+        .unwrap_or_else(|| panic!("read did not return fileRef after invalid patch: {read:?}"));
+
     let patched = call(
         &ep,
         "ses_patch_hash_ref",

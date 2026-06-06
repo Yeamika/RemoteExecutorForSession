@@ -310,7 +310,7 @@ pub fn file_action() -> McpToolDef {
     )
 }
 
-/// Read a file via REC. Supports file references ("filename #ABCD") and direct paths.
+/// REC file read. Supports file references ("filename #ABCD") and direct paths.
 ///
 /// Captured MCP input (mode=text):
 /// ```json
@@ -418,7 +418,7 @@ pub fn file_action() -> McpToolDef {
 pub fn read() -> McpToolDef {
     tool_def(
         "read",
-        "Read a file via REC. Accepts direct paths, REC file keys, and hashRef labels such as `filename #ABCD`. File reads return `<fileRef>filename #ABCD</fileRef>` for files by default; use that inner label as `fileKey` for later read/FileAction patch calls.",
+        "REC file read. Accepts direct paths, REC file keys, and hashRef labels such as `filename #ABCD`. File reads return `<fileRef>filename #ABCD</fileRef>` for files by default; use that inner label as `fileKey` for later read/FileAction patch calls.",
         vec!["fileKey"],
         vec![
             exec_session_prop(),
@@ -1030,7 +1030,7 @@ pub fn exbash() -> McpToolDef {
             prop("timeout", integer_prop("Total lifetime timeout in milliseconds. Omit, 0, or -1 to leave the run unmanaged.")),
             prop("read_timeout", integer_prop("How long to wait before returning. If the process is still running at timeout, the tool returns a detached snapshot with `asyncID`.")),
             prop("asyncID", string_prop("Run id returned by detached `run` or `shell`; required for `attach`, `stop`, and `remove`.")),
-            prop("text", string_prop("Text to write to PTY stdin in `attach` mode. Escape sequences are decoded before writing; use `\\n` for Enter/newline and `\\u0003` for Ctrl-C/control bytes.")),
+            prop("text", string_prop("Text to write to PTY stdin in `attach` mode. Interactive programs may require control bytes; escape sequences are decoded before writing, so use `\\n` for Enter/newline and `\\u0003` for Ctrl-C/control bytes.")),
             prop("filePath", string_prop("File path for `attach` mode input. Mutually exclusive with `text`.")),
             prop("workdir", string_prop("Working directory for `run` and `shell` commands.")),
             prop("showRawPretty", boolean_prop("Include raw PTY text in attach metadata.")),

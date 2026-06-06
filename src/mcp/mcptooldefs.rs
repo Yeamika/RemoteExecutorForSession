@@ -1328,7 +1328,7 @@ pub fn exbash() -> McpToolDef {
 pub fn remote_executor_manager() -> McpToolDef {
     tool_def(
         "RemoteExecutorManager",
-        "Manage RemoteExecutor: list/connect executors, set default, list shell profiles.",
+        "Manage RemoteExecutor: list/connect executors, set default, list shell profiles, or request settings reload.",
         vec!["method"],
         vec![
             exec_session_prop(),
@@ -1340,6 +1340,7 @@ pub fn remote_executor_manager() -> McpToolDef {
                     "connect_to_executor",
                     "list_shells",
                     "set_executor_shell",
+                    "request_reload",
                 ]),
             ),
             prop("id", string_prop("Executor ID")),

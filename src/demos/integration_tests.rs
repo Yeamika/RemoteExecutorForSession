@@ -55,6 +55,29 @@ fn matrix_conflict_marker(session_idx: usize, attempt_idx: usize, file_idx: usiz
     format!("conflict session={session_idx:04} attempt={attempt_idx:02} file={file_idx:02}\n")
 }
 
+fn re_shell_settings(default_shell: &str) -> String {
+    json!({
+        "version": 1,
+        "shells": {
+            "default": default_shell,
+            "interactive": "one",
+            "profiles": {
+                "one": {
+                    "candidates": ["sh"],
+                    "commandArgs": ["-c", "echo one-marker; {command}"],
+                    "interactiveArgs": []
+                },
+                "two": {
+                    "candidates": ["sh"],
+                    "commandArgs": ["-c", "echo two-marker; {command}"],
+                    "interactiveArgs": []
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
 fn rng(seed: usize) -> usize {
     let mut x = seed
         .wrapping_mul(6364136223846793005)
@@ -1251,9 +1274,11 @@ async fn exbash_plaintext_exitcode_defaults_and_list_scope() {
     let run_text = text(&run);
     assert!(
         run_text.contains("complete-run")
+            && run_text.contains("\ncommand:echo complete-run")
+            && run_text.contains("\ncwd:")
             && run_text.contains("\ntotaloutput:")
             && run_text.ends_with("bytes\nexitcode:0"),
-        "completed run text should include output, totaloutput, and exitcode, got: {:?}",
+        "completed run text should include output, command, cwd, totaloutput, and exitcode, got: {:?}",
         run_text
     );
 
@@ -1272,9 +1297,11 @@ async fn exbash_plaintext_exitcode_defaults_and_list_scope() {
     let default_shell_text = text(&default_shell);
     assert!(
         default_shell_text.contains("default-shell")
+            && default_shell_text.contains("\ncommand:")
+            && default_shell_text.contains("\ncwd:")
             && default_shell_text.contains("\ntotaloutput:")
             && default_shell_text.ends_with("bytes\nexitcode:0"),
-        "default shell text should include output, totaloutput, and exitcode, got: {:?}",
+        "default shell text should include output, command, cwd, totaloutput, and exitcode, got: {:?}",
         default_shell_text
     );
 
@@ -1292,11 +1319,40 @@ async fn exbash_plaintext_exitcode_defaults_and_list_scope() {
     );
     let detached_text = text(&detached);
     assert!(
-        detached_text.starts_with('\n') && detached_text.contains(" detached"),
-        "detached text should start on a new line, got: {:?}",
+        detached_text.starts_with('\n')
+            && detached_text.contains("\ncommand:sleep 5")
+            && detached_text.contains("\ncwd:")
+            && detached_text.contains(" detached"),
+        "detached text should show actual command/cwd and detached marker, got: {:?}",
         detached_text
     );
     let async_id = meta(&detached)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let detached_shell = call_structured(
+        &ep,
+        "ses_exbash_plain",
+        "exbash",
+        json!({"mode":"shell","command":"sleep 5","read_timeout":10}),
+    )
+    .await;
+    assert!(
+        detached_shell["error"].is_null(),
+        "detached shell failed: {:?}",
+        detached_shell["error"]
+    );
+    let detached_shell_text = text(&detached_shell);
+    assert!(
+        detached_shell_text.contains("\ncommand:")
+            && detached_shell_text.contains("sleep 5")
+            && detached_shell_text.contains("\ncwd:")
+            && detached_shell_text.contains(" detached"),
+        "detached shell text should show resolved shell command/cwd, got: {:?}",
+        detached_shell_text
+    );
+    let shell_async_id = meta(&detached_shell)["metadata"]["asyncID"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1305,9 +1361,10 @@ async fn exbash_plaintext_exitcode_defaults_and_list_scope() {
     assert!(list["error"].is_null(), "list failed: {:?}", list["error"]);
     let list_text = text(&list);
     assert!(
-        list_text.contains("local:1 workspace:0")
+        list_text.contains("local:2 workspace:0")
             && list_text.contains("showing executor=all of local")
-            && list_text.contains(&format!("- local:{async_id} running")),
+            && list_text.contains(&format!("- local:{async_id} running"))
+            && list_text.contains(&format!("- local:{shell_async_id} running")),
         "list should be plaintext session view, got: {:?}",
         list_text
     );
@@ -1330,6 +1387,13 @@ async fn exbash_plaintext_exitcode_defaults_and_list_scope() {
         "ses_exbash_plain",
         "exbash",
         json!({"mode":"stop","asyncID":async_id}),
+    )
+    .await;
+    let _ = call(
+        &ep,
+        "ses_exbash_plain",
+        "exbash",
+        json!({"mode":"stop","asyncID":shell_async_id}),
     )
     .await;
 }
@@ -1749,6 +1813,121 @@ async fn manager_list_shells_routes_through_executor() {
     assert!(
         response["result"]["structuredContent"].is_null(),
         "structuredContent should be omitted by default"
+    );
+}
+
+#[tokio::test]
+async fn manager_request_reload_rebuilds_workspace_settings_and_reports_plaintext_errors() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let settings_path = dir.path().join(".re-setting.json");
+    std::fs::write(&settings_path, re_shell_settings("one")).unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_manager_reload",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let first = call(
+        &ep,
+        "ses_manager_reload",
+        "RemoteExecutorManager",
+        json!({"method":"list_shells","executor":"local"}),
+    )
+    .await;
+    assert!(
+        first["error"].is_null(),
+        "first list failed: {:?}",
+        first["error"]
+    );
+    assert!(text(&first).starts_with("default:one\n"), "{first:?}");
+
+    std::fs::write(&settings_path, re_shell_settings("two")).unwrap();
+    let before_reload = call(
+        &ep,
+        "ses_manager_reload",
+        "RemoteExecutorManager",
+        json!({"method":"list_shells","executor":"local"}),
+    )
+    .await;
+    assert!(
+        before_reload["error"].is_null(),
+        "pre-reload list failed: {:?}",
+        before_reload["error"]
+    );
+    assert!(
+        text(&before_reload).starts_with("default:one\n"),
+        "{before_reload:?}"
+    );
+
+    let reload = call(
+        &ep,
+        "ses_manager_reload",
+        "RemoteExecutorManager",
+        json!({"method":"request_reload","executor":"local"}),
+    )
+    .await;
+    assert!(
+        reload["error"].is_null(),
+        "reload failed: {:?}",
+        reload["error"]
+    );
+    let reload_text = text(&reload);
+    assert!(
+        reload_text.starts_with("reloaded:true\ndefault:two\n"),
+        "{reload_text}"
+    );
+
+    std::fs::write(&settings_path, "{ broken").unwrap();
+    let bad_reload = call(
+        &ep,
+        "ses_manager_reload",
+        "RemoteExecutorManager",
+        json!({"method":"request_reload","executor":"local"}),
+    )
+    .await;
+    let error = bad_reload["error"]["message"].as_str().unwrap_or("");
+    assert!(error.contains("reloaded:false"), "{bad_reload:?}");
+    assert!(
+        error.contains(&format!("settingsPath:{}", settings_path.to_string_lossy())),
+        "{bad_reload:?}"
+    );
+    assert!(
+        error.contains("error:failed to parse settings file"),
+        "{bad_reload:?}"
+    );
+    assert!(error.contains("cause:"), "{bad_reload:?}");
+    assert!(error.contains("line"), "{bad_reload:?}");
+
+    let after_bad = call(
+        &ep,
+        "ses_manager_reload",
+        "RemoteExecutorManager",
+        json!({"method":"list_shells","executor":"local"}),
+    )
+    .await;
+    assert!(
+        after_bad["error"].is_null(),
+        "list after bad reload failed: {:?}",
+        after_bad["error"]
+    );
+    let after_bad_text = text(&after_bad);
+    assert!(
+        after_bad_text.starts_with("default:two\n"),
+        "{after_bad_text}"
+    );
+    assert!(
+        after_bad_text.contains("settingsError:reloaded:false")
+            && after_bad_text.contains("error:failed to parse settings file"),
+        "{after_bad_text}"
     );
 }
 

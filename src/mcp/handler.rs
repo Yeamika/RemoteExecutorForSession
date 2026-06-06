@@ -1017,7 +1017,10 @@ fn format_exbash_run_or_shell_output(result: &Value) -> String {
 
     if let Some(exit_code) = result.pointer("/metadata/exitCode") {
         let total_output_bytes = exbash_completed_output_bytes(result, &text);
-        append_completion_footer(&mut text, total_output_bytes, &json_value_text(exit_code));
+        let mut footer = exbash_execution_footer_lines(result);
+        footer.push(format!("totaloutput:{total_output_bytes}bytes"));
+        footer.push(format!("exitcode:{}", json_value_text(exit_code)));
+        append_footer_lines(&mut text, footer);
         return text;
     }
 
@@ -1027,6 +1030,7 @@ fn format_exbash_run_or_shell_output(result: &Value) -> String {
         .unwrap_or(false)
         || result.pointer("/metadata/asyncID").is_some();
     if detached {
+        append_footer_lines(&mut text, exbash_execution_footer_lines(result));
         if !message.is_empty() {
             append_visible_line(&mut text, message);
         }
@@ -1094,11 +1098,23 @@ fn append_visible_line(text: &mut String, line: &str) {
     text.push_str(line);
 }
 
-fn append_completion_footer(text: &mut String, total_output_bytes: usize, exit_code: &str) {
+fn append_footer_lines(text: &mut String, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
     ensure_blank_line(text);
-    text.push_str(&format!(
-        "totaloutput:{total_output_bytes}bytes\nexitcode:{exit_code}"
-    ));
+    text.push_str(&lines.join("\n"));
+}
+
+fn exbash_execution_footer_lines(result: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(command) = result.pointer("/metadata/command").and_then(Value::as_str) {
+        lines.push(format!("command:{command}"));
+    }
+    if let Some(cwd) = result.pointer("/metadata/cwd").and_then(Value::as_str) {
+        lines.push(format!("cwd:{cwd}"));
+    }
+    lines
 }
 
 fn ensure_blank_line(text: &mut String) {
@@ -1330,24 +1346,30 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                if method == "list_shells" || method == "set_executor_shell" {
+                if method == "list_shells"
+                    || method == "set_executor_shell"
+                    || method == "request_reload"
+                {
                     let mut call_args = arguments;
                     remove_field(&mut call_args, "method");
-                    let tool_method = if method == "list_shells" {
-                        "list_shells"
-                    } else {
-                        if let Some(object) = call_args.as_object_mut() {
-                            let missing_shell = object
-                                .get("shell")
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|value| !value.is_empty())
-                                .is_none();
-                            if missing_shell {
-                                object.insert("shell".to_string(), Value::String("auto".into()));
+                    let tool_method = match method.as_str() {
+                        "list_shells" => "list_shells",
+                        "request_reload" => "request_reload",
+                        _ => {
+                            if let Some(object) = call_args.as_object_mut() {
+                                let missing_shell = object
+                                    .get("shell")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|value| !value.is_empty())
+                                    .is_none();
+                                if missing_shell {
+                                    object
+                                        .insert("shell".to_string(), Value::String("auto".into()));
+                                }
                             }
+                            "set_default_shell"
                         }
-                        "set_default_shell"
                     };
                     let result = self
                         .call_executor_tool(&scope, tool_method, call_args)

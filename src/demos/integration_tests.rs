@@ -395,6 +395,7 @@ async fn run_session(
     let mut file_paths: Vec<Option<PathBuf>> = vec![None; plan.len()];
     let mut file_refs: Vec<Option<String>> = vec![None; plan.len()];
     let mut file_executors: Vec<Option<&'static str>> = vec![None; plan.len()];
+    let mut file_first_lines: Vec<Option<String>> = vec![None; plan.len()];
     let mut task_ids: Vec<Option<String>> = vec![None; plan.len()];
     let mut pass = 0usize;
     let mut fail = 0usize;
@@ -426,7 +427,13 @@ async fn run_session(
                     pty_skipped += 1;
                     continue;
                 };
-                call(ep, &session_id, "FileAction", json!({"mode":"patch","fileKey":key,"patchText":"insert -1\n+// patched\n","executor":file_executor})).await
+                let first_line = file_first_lines[*file_idx]
+                    .as_deref()
+                    .unwrap_or("fn placeholder(){}");
+                let patch_text = format!(
+                    "@@ -1,1 +1,2 @@\n {first_line}\n+// patched session={si} call={ci}\n"
+                );
+                call(ep, &session_id, "FileAction", json!({"mode":"patch","fileKey":key,"patchText":patch_text,"executor":file_executor})).await
             }
             Action::Rename { file_idx, new_name } => {
                 let file_executor = file_executors[*file_idx].unwrap_or(executor);
@@ -470,10 +477,11 @@ async fn run_session(
         }
 
         let matched = match action {
-            Action::Create { name, .. } => {
+            Action::Create { name, content } => {
                 if ok(&resp) {
                     file_paths[ci] = Some(dir.join(name));
                     file_executors[ci] = Some(executor);
+                    file_first_lines[ci] = content.lines().next().map(str::to_string);
                     let output = text(&resp);
                     let fref = output
                         .lines()

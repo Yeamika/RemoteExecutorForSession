@@ -1782,8 +1782,9 @@ async fn rg_plaintext_includes_matches_and_code_footer() {
     );
     let output = text(&response);
     assert!(
-        output.contains("demo.rs:1:1:fn main() {}") && output.ends_with("matches:1\ncode:0"),
-        "rg text should include matches/code footer, got: {:?}",
+        output.contains("demo.rs:1:1:fn main() {}")
+            && output.ends_with("matches:1\nfilesWalked:1\ncode:0"),
+        "rg text should include matches/filesWalked/code footer, got: {:?}",
         output
     );
 }
@@ -1827,7 +1828,7 @@ async fn rg_files_mode_matches_paths_by_glob_pattern() {
     assert!(
         output.contains("demo.rs")
             && !output.contains("notes.txt")
-            && output.ends_with("matches:1\ncode:0"),
+            && output.ends_with("matches:1\nfilesWalked:2\ncode:0"),
         "rg files mode should return matching paths and footer, got: {:?}",
         output
     );

@@ -455,6 +455,7 @@ pub fn read() -> McpToolDef {
 ///       "includeStructuredContent": true,
 ///       "pattern": "fn",
 ///       "path": "/tmp/.tmp8V7Cxa",
+///       "timeout": 10000,
 ///       "executor": "local"
 ///     }
 ///   }
@@ -473,12 +474,15 @@ pub fn read() -> McpToolDef {
 ///         "text": "/tmp/.tmp8V7Cxa/demo.rs:1:1:fn main() {
 ///
 /// matches:1
+/// filesWalked:1
 /// code:0"
 ///       }
 ///     ],
 ///     "structuredContent": {
 ///       "metadata": {
 ///         "matches": 1,
+///         "filesWalked": 1,
+///         "timedOut": false,
 ///         "code": 0
 ///       }
 ///     }
@@ -500,6 +504,7 @@ pub fn read() -> McpToolDef {
 ///       "mode": "files",
 ///       "pattern": "*.rs",
 ///       "path": "/tmp/.tmp8V7Cxa",
+///       "timeout": 10000,
 ///       "executor": "local"
 ///     }
 ///   }
@@ -518,6 +523,7 @@ pub fn read() -> McpToolDef {
 ///         "text": "/tmp/.tmp8V7Cxa/demo.rs
 ///
 /// matches:1
+/// filesWalked:2
 /// code:0"
 ///       }
 ///     ],
@@ -525,6 +531,8 @@ pub fn read() -> McpToolDef {
 ///       "metadata": {
 ///         "count": 1,
 ///         "truncated": false,
+///         "filesWalked": 2,
+///         "timedOut": false,
 ///         "mode": "files",
 ///         "matches": 1,
 ///         "code": 0
@@ -536,7 +544,7 @@ pub fn read() -> McpToolDef {
 pub fn rg() -> McpToolDef {
     tool_def(
         "rg",
-        "REC rg search. mode=content searches file contents and returns matching lines. mode=files matches file paths by glob pattern and returns paths. Search results are paths, not hashRefs; call `read` on a path first when a later edit should use a stale-safe `fileKey`.",
+        "REC rg search. mode=content searches file contents and returns matching lines. mode=files matches file paths by glob pattern and returns paths. `timeout` is a soft search deadline in milliseconds: default 10000, -1 disables it, and timeout returns collected results instead of an error. Search results are paths, not hashRefs; call `read` on a path first when a later edit should use a stale-safe `fileKey`.",
         vec!["pattern"],
         vec![
             exec_session_prop(),
@@ -572,6 +580,10 @@ pub fn rg() -> McpToolDef {
             prop(
                 "max_count",
                 integer_prop("Content mode maximum number of matches to return"),
+            ),
+            prop(
+                "timeout",
+                integer_prop("Soft search timeout in milliseconds. Default 10000. Use -1 for no timeout. When the deadline is reached, collected results are returned."),
             ),
         ],
     )

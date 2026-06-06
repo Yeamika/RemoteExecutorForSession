@@ -955,6 +955,16 @@ fn format_rg_output(result: &Value) -> String {
     if let Some(matches) = result.pointer("/metadata/matches") {
         footer.push(format!("matches:{}", json_value_text(matches)));
     }
+    if let Some(files_walked) = result.pointer("/metadata/filesWalked") {
+        footer.push(format!("filesWalked:{}", json_value_text(files_walked)));
+    }
+    if result
+        .pointer("/metadata/timedOut")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        footer.push("timedOut:true".to_string());
+    }
     if let Some(code) = result.pointer("/metadata/code") {
         footer.push(format!("code:{}", json_value_text(code)));
     }

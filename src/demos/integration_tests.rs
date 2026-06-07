@@ -1437,6 +1437,16 @@ async fn exbash_local_terminal_events_sync_host_tracking() {
             .await;
     assert_eq!(exited_snapshot.exit_code, Some(7));
     assert!(exited_snapshot.ended_at.is_some());
+    assert!(exited_snapshot.description.is_none());
+
+    let list = call(&ep, "ses_exbash_events", "exbash", json!({"mode":"list"})).await;
+    let list_text = text(&list);
+    assert!(
+        list_text.contains("description= command=sh -lc sleep 0.05; exit 7")
+            && !list_text.contains("description=sh -lc"),
+        "list should keep missing description empty, got: {:?}",
+        list_text
+    );
 
     let timed_out = call_structured(
         &ep,

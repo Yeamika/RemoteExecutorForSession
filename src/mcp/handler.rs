@@ -181,6 +181,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         result: &serde_json::Value,
         tracking_scope: &str,
         requested_mode: &str,
+        requested_description: Option<String>,
     ) -> Option<ExbashTaskSnapshot> {
         if !exbash_mode_creates_task(requested_mode) {
             return None;
@@ -196,10 +197,6 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             .to_string();
         let command = result
             .pointer("/metadata/command")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let description = result
-            .pointer("/metadata/description")
             .and_then(Value::as_str)
             .map(str::to_string);
         let state = Some(normalized_exbash_state(result, requested_mode, None));
@@ -219,7 +216,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             started_at,
             ended_at,
             command,
-            description,
+            description: requested_description,
             total_output,
         };
         if tracking_scope == "remote" {
@@ -831,9 +828,11 @@ fn exbash_sync_input_from_existing(
                 existing.ended_at
             }
         }),
-        command: metadata_string(result, "command").or_else(|| existing.command.clone()),
-        description: metadata_string(result, "description")
-            .or_else(|| existing.description.clone()),
+        command: existing
+            .command
+            .clone()
+            .or_else(|| metadata_string(result, "command")),
+        description: existing.description.clone(),
         total_output: metadata_i64(result, "totalOutput").or(existing.total_output),
     }
 }
@@ -962,7 +961,7 @@ fn format_exbash_task(task: &ExbashTaskSnapshot) -> String {
         task.async_id,
         state,
         total_output,
-        single_line_exbash_list_text(description),
+        clipped_exbash_list_text(description),
         clipped_exbash_list_command(command)
     )
 }
@@ -987,7 +986,7 @@ fn format_remote_exbash_run(run: &Value) -> String {
         .unwrap_or_else(|| "0".to_string());
     let command = run.get("command").and_then(Value::as_str).unwrap_or("");
     let description = run.get("description").and_then(Value::as_str).unwrap_or("");
-    let description = single_line_exbash_list_text(description);
+    let description = clipped_exbash_list_text(description);
     let command = clipped_exbash_list_command(command);
     format!(
         "- {async_id} {state} totalOutput={total_output} description={description} command={command}"
@@ -995,7 +994,11 @@ fn format_remote_exbash_run(run: &Value) -> String {
 }
 
 fn clipped_exbash_list_command(command: &str) -> String {
-    single_line_exbash_list_text(command)
+    clipped_exbash_list_text(command)
+}
+
+fn clipped_exbash_list_text(text: &str) -> String {
+    single_line_exbash_list_text(text)
         .chars()
         .take(30)
         .collect()
@@ -1256,6 +1259,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 let requested_executor = optional_string_field(&call_args, "executor")
                     .or_else(|| optional_string_field(&call_args, "targetExecutor"))
                     .unwrap_or_else(|| "local".to_string());
+                let requested_description = optional_string_field(&call_args, "description");
                 self.check_exbash_create_allowed(&scope, &tracking_scope, &call_args)
                     .await?;
                 remove_field(&mut call_args, "scope");
@@ -1277,7 +1281,13 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 };
                 let mut value = result;
                 if let Some(snapshot) = self
-                    .upsert_exbash_from_result(&scope, &value, &tracking_scope, &mode)
+                    .upsert_exbash_from_result(
+                        &scope,
+                        &value,
+                        &tracking_scope,
+                        &mode,
+                        requested_description,
+                    )
                     .await
                 {
                     value["metadata"]["hostSnapshot"] =
@@ -1705,7 +1715,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exbash_task_list_line_keeps_description_and_clips_command() {
+    fn exbash_task_list_line_clips_description_and_command() {
         let line = format_exbash_task(&ExbashTaskSnapshot {
             async_id: "rex-test".to_string(),
             executor: "local".to_string(),
@@ -1717,30 +1727,30 @@ mod tests {
             started_at: None,
             ended_at: None,
             command: Some("012345678901234567890123456789EXTRA\nnext".to_string()),
-            description: Some("full description\nwith newline".to_string()),
+            description: Some("abcdefghijklmnopqrstuvwxyz123456EXTRA\nnext".to_string()),
             total_output: Some(12),
         });
 
         assert!(line.contains(
-            "totalOutput=12 description=full description\\nwith newline command=012345678901234567890123456789"
+            "totalOutput=12 description=abcdefghijklmnopqrstuvwxyz1234 command=012345678901234567890123456789"
         ));
         assert!(!line.contains("EXTRA"));
-        assert!(!line.contains("description=full description\nwith newline"));
+        assert!(!line.contains("description=abcdefghijklmnopqrstuvwxyz123456"));
     }
 
     #[test]
-    fn remote_exbash_list_line_keeps_description_and_clips_command() {
+    fn remote_exbash_list_line_clips_description_and_command() {
         let line = format_remote_exbash_run(&serde_json::json!({
             "asyncID": "rex-remote",
             "state": "running",
             "totalOutput": 8,
-            "description": "remote description\nwith newline",
+            "description": "012345678901234567890123456789EXTRA\nnext",
             "command": "abcdefghijklmnopqrstuvwxyz123456EXTRA"
         }));
 
         assert_eq!(
             line,
-            "- rex-remote running totalOutput=8 description=remote description\\nwith newline command=abcdefghijklmnopqrstuvwxyz1234"
+            "- rex-remote running totalOutput=8 description=012345678901234567890123456789 command=abcdefghijklmnopqrstuvwxyz1234"
         );
     }
 

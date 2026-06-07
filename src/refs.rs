@@ -17,11 +17,10 @@ pub struct FileRefInjection {
 }
 
 pub fn basename(input: &str) -> String {
-    input
-        .replace('\\', "/")
+    let normalized = input.replace('\\', "/");
+    normalized
         .split('/')
-        .filter(|part| !part.is_empty())
-        .last()
+        .rfind(|part| !part.is_empty())
         .unwrap_or(input)
         .to_string()
 }

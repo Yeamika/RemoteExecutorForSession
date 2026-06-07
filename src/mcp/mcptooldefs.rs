@@ -278,18 +278,9 @@ fn tool_def(
 pub fn file_action() -> McpToolDef {
     tool_def(
         "FileAction",
-        r#"REC file action: patch, create, delete, or rename a file. mode=patch requires the hashRef label returned by read/FileAction, e.g. `App.ts #A1B2`, as `fileKey`; call read first and pass the `<fileRef>...</fileRef>` value. The hashRef resolves the file and applies hash checking before mutation.
+        r#"REC file action: patch, create, delete, or rename a file.
 
-Patch example:
-1. read returns `<fileRef>notes.txt #A1B2</fileRef>`
-2. call FileAction with `mode="patch"`, `fileKey="notes.txt #A1B2"`, and:
-```diff
-@@ -3,2 +3,2 @@
--status: pending
--message: replace this line
-+status: success
-+message: patch applied successfully
-```"#,
+For `mode="patch"`, do not pass a direct path. First call `read` on the file, copy the exact label inside `<fileRef>...</fileRef>` such as `App.ts #A1B2`, then pass that label as `fileKey`. The hashRef resolves the file and applies stale-file hash checking before mutation."#,
         vec!["mode"],
         vec![
             exec_session_prop(),
@@ -300,7 +291,7 @@ Patch example:
             ),
             prop(
                 "fileKey",
-                string_prop("mode=patch: required hashRef label such as `App.ts #A1B2` from `<fileRef>...</fileRef>`. Other modes may use a direct path, REC file key, or hashRef label."),
+                string_prop("mode=patch: required hashRef label such as `App.ts #A1B2` from `<fileRef>...</fileRef>`; direct paths are rejected for patch. Other modes may use a direct path, REC file key, or hashRef label."),
             ),
             prop(
                 "newFilePath",
@@ -309,7 +300,15 @@ Patch example:
             prop(
                 "patchText",
                 string_prop(
-                    "Patch text for mode=patch. Prefer a unified diff hunk starting with `@@`; use the hashRef label from read/FileAction as fileKey.",
+                    r#"Patch text for mode=patch. Use unified diff hunks starting with `@@`; keep context lines accurate. Example:
+```diff
+@@ -3,2 +3,2 @@
+-status: pending
+-message: replace this line
++status: success
++message: patch applied successfully
+```
+Use the hashRef label from read/FileAction as fileKey."#,
                 ),
             ),
             prop(
@@ -560,7 +559,7 @@ pub fn read() -> McpToolDef {
 pub fn rg() -> McpToolDef {
     tool_def(
         "rg",
-        "REC rg search. mode=content searches file contents and returns matching lines. mode=files matches file paths by glob pattern and returns paths. `timeout` is a soft search deadline in milliseconds: default 10000, -1 disables it, and timeout returns collected results instead of an error. Search results are paths, not hashRefs; call `read` on a path first when a later edit should use a stale-safe `fileKey`.",
+        "REC rg search. mode=content searches file contents and returns matching lines. mode=files matches file paths by glob pattern and returns paths. Local content searches with no path or path='.' are rooted at the current session workdir. In content mode, basename globs such as `small.txt` are matched recursively like `**/small.txt`. `timeout` is a soft search deadline in milliseconds: default 10000, -1 disables it, and timeout returns collected results instead of an error. Search results are paths, not hashRefs; call `read` on a path first when a later edit should use a stale-safe `fileKey`.",
         vec!["pattern"],
         vec![
             exec_session_prop(),
@@ -587,8 +586,8 @@ pub fn rg() -> McpToolDef {
                     "content mode: regex pattern to search for. files mode: glob pattern such as `*.rs` or `src/**/*.ts`.",
                 ),
             ),
-            prop("path", string_prop("Specific file or directory to search")),
-            prop("globs", array_string_desc("Content mode file glob filters")),
+            prop("path", string_prop("Specific file or directory to search. In local content mode, omit or use `.` to search the current session workdir.")),
+            prop("globs", array_string_desc("Content mode file glob filters. Basename globs such as `small.txt` also match recursively.")),
             prop(
                 "case_sensitive",
                 boolean_default("Content mode case-sensitive matching", true),

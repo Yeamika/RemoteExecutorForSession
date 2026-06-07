@@ -641,7 +641,7 @@ fn require_patch_hash_ref(arguments: &Value) -> Result<(), JsonRpcError> {
         return Ok(());
     }
     Err(JsonRpcError::invalid_params(
-        "FileAction mode=patch requires fileKey to be a hashRef returned by read/FileAction, such as `App.ts #A1B2`; call read first and pass the <fileRef> value.",
+        "FileAction mode=patch requires fileKey to be the hashRef label from a prior read/FileAction result, such as `App.ts #A1B2`. Do not pass a direct file path for patch; call read first and pass the exact text inside <fileRef>...</fileRef>.",
     ))
 }
 
@@ -851,6 +851,59 @@ fn extract_rg_mode(arguments: &Value) -> Result<RgMode, JsonRpcError> {
     }
 }
 
+fn prepare_rg_arguments(scope: &CallScope, mode: RgMode, arguments: &mut Value) {
+    if mode != RgMode::Content {
+        return;
+    }
+    let Some(object) = arguments.as_object_mut() else {
+        return;
+    };
+    let executor = object
+        .get("executor")
+        .or_else(|| object.get("targetExecutor"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local");
+    if executor == "local" {
+        object
+            .entry("root".to_string())
+            .or_insert_with(|| Value::String(scope.workdir.clone()));
+    }
+    expand_basename_globs(arguments);
+}
+
+fn expand_basename_globs(arguments: &mut Value) {
+    let Some(globs) = arguments
+        .as_object_mut()
+        .and_then(|object| object.get_mut("globs"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut additions = Vec::new();
+    for glob in globs.iter().filter_map(Value::as_str) {
+        if !needs_recursive_basename_glob(glob) {
+            continue;
+        }
+        let expanded = format!("**/{glob}");
+        if globs
+            .iter()
+            .any(|existing| existing.as_str() == Some(&expanded))
+            || additions.iter().any(|existing| existing == &expanded)
+        {
+            continue;
+        }
+        additions.push(expanded);
+    }
+    globs.extend(additions.into_iter().map(Value::String));
+}
+
+fn needs_recursive_basename_glob(glob: &str) -> bool {
+    let glob = glob.trim();
+    !glob.is_empty() && !glob.starts_with("**/") && !glob.contains('/') && !glob.contains('\\')
+}
+
 fn exbash_list_header(
     local_count: usize,
     workspace_count: usize,
@@ -949,54 +1002,7 @@ fn clipped_exbash_list_command(command: &str) -> String {
 }
 
 fn single_line_exbash_list_text(text: &str) -> String {
-    text.replace("\r\n", "\\n")
-        .replace('\n', "\\n")
-        .replace('\r', "\\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exbash_task_list_line_keeps_description_and_clips_command() {
-        let line = format_exbash_task(&ExbashTaskSnapshot {
-            async_id: "rex-test".to_string(),
-            executor: "local".to_string(),
-            session_id: Some("session".to_string()),
-            workdir: None,
-            state: Some("running".to_string()),
-            pid: None,
-            exit_code: None,
-            started_at: None,
-            ended_at: None,
-            command: Some("012345678901234567890123456789EXTRA\nnext".to_string()),
-            description: Some("full description\nwith newline".to_string()),
-            total_output: Some(12),
-        });
-
-        assert!(line.contains(
-            "totalOutput=12 description=full description\\nwith newline command=012345678901234567890123456789"
-        ));
-        assert!(!line.contains("EXTRA"));
-        assert!(!line.contains("description=full description\nwith newline"));
-    }
-
-    #[test]
-    fn remote_exbash_list_line_keeps_description_and_clips_command() {
-        let line = format_remote_exbash_run(&serde_json::json!({
-            "asyncID": "rex-remote",
-            "state": "running",
-            "totalOutput": 8,
-            "description": "remote description\nwith newline",
-            "command": "abcdefghijklmnopqrstuvwxyz123456EXTRA"
-        }));
-
-        assert_eq!(
-            line,
-            "- rex-remote running totalOutput=8 description=remote description\\nwith newline command=abcdefghijklmnopqrstuvwxyz1234"
-        );
-    }
+    text.replace("\r\n", "\\n").replace(['\n', '\r'], "\\n")
 }
 
 fn format_exbash_run_or_shell_output(result: &Value) -> String {
@@ -1138,9 +1144,9 @@ fn exbash_completed_output_bytes(result: &Value, visible_text: &str) -> usize {
             result
                 .pointer("/metadata/output")
                 .and_then(Value::as_str)
-                .map(|value| value.as_bytes().len())
+                .map(|value| value.len())
         })
-        .unwrap_or_else(|| visible_text.as_bytes().len())
+        .unwrap_or(visible_text.len())
 }
 
 fn json_value_text(value: &Value) -> String {
@@ -1324,6 +1330,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     RgMode::Files => "glob",
                 };
                 let mut call_args = arguments;
+                prepare_rg_arguments(&scope, mode, &mut call_args);
                 remove_field(&mut call_args, "mode");
                 remove_field(&mut call_args, "type");
                 let result = self.call_executor_tool(&scope, method, call_args).await?;
@@ -1690,5 +1697,89 @@ impl crate::host::RemoteExecutorConfigStore for DummySessionHost {
             workdir: workdir.to_string(),
             config: patch,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exbash_task_list_line_keeps_description_and_clips_command() {
+        let line = format_exbash_task(&ExbashTaskSnapshot {
+            async_id: "rex-test".to_string(),
+            executor: "local".to_string(),
+            session_id: Some("session".to_string()),
+            workdir: None,
+            state: Some("running".to_string()),
+            pid: None,
+            exit_code: None,
+            started_at: None,
+            ended_at: None,
+            command: Some("012345678901234567890123456789EXTRA\nnext".to_string()),
+            description: Some("full description\nwith newline".to_string()),
+            total_output: Some(12),
+        });
+
+        assert!(line.contains(
+            "totalOutput=12 description=full description\\nwith newline command=012345678901234567890123456789"
+        ));
+        assert!(!line.contains("EXTRA"));
+        assert!(!line.contains("description=full description\nwith newline"));
+    }
+
+    #[test]
+    fn remote_exbash_list_line_keeps_description_and_clips_command() {
+        let line = format_remote_exbash_run(&serde_json::json!({
+            "asyncID": "rex-remote",
+            "state": "running",
+            "totalOutput": 8,
+            "description": "remote description\nwith newline",
+            "command": "abcdefghijklmnopqrstuvwxyz123456EXTRA"
+        }));
+
+        assert_eq!(
+            line,
+            "- rex-remote running totalOutput=8 description=remote description\\nwith newline command=abcdefghijklmnopqrstuvwxyz1234"
+        );
+    }
+
+    #[test]
+    fn rg_content_basename_globs_are_recursive() {
+        let mut args = json!({ "globs": ["small.txt", "*.rs", "src/*.ts", "**/*.md"] });
+        expand_basename_globs(&mut args);
+        assert_eq!(
+            args["globs"],
+            json!([
+                "small.txt",
+                "*.rs",
+                "src/*.ts",
+                "**/*.md",
+                "**/small.txt",
+                "**/*.rs"
+            ])
+        );
+    }
+
+    #[test]
+    fn local_rg_content_defaults_to_session_workdir_root() {
+        let scope = CallScope {
+            session_id: "ses".to_string(),
+            workdir: "/workspace/current".to_string(),
+        };
+        let mut args = json!({ "pattern": "needle" });
+        prepare_rg_arguments(&scope, RgMode::Content, &mut args);
+        assert_eq!(args["root"], "/workspace/current");
+    }
+
+    #[test]
+    fn remote_rg_content_does_not_inject_local_workdir_root() {
+        let scope = CallScope {
+            session_id: "ses".to_string(),
+            workdir: "/workspace/current".to_string(),
+        };
+        let mut args = json!({ "pattern": "needle", "executor": "exec_1" });
+        prepare_rg_arguments(&scope, RgMode::Content, &mut args);
+        assert!(args.get("root").is_none());
     }
 }

@@ -68,17 +68,12 @@ async fn handle_single(
     endpoint: &JsonRpcEndpoint<impl remote_executor_for_session::JsonRpcHandler>,
     input: Value,
 ) -> Option<Value> {
-    let id = input.get("id").cloned();
+    let id = input.get("id").cloned()?;
     let method = input
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    if id.is_none() {
-        return None;
-    }
-
-    let id = id.unwrap_or(Value::Null);
     match method {
         "initialize" => Some(initialize_response(
             id,

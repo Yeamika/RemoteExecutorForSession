@@ -1965,11 +1965,10 @@ async fn file_action_patch_requires_hash_ref() {
     )
     .await;
     assert_eq!(rejected["error"]["code"], json!(-32602));
+    let error_message = rejected["error"]["message"].as_str().unwrap_or("");
     assert!(
-        rejected["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("requires fileKey to be a hashRef"),
+        error_message.contains("requires fileKey to be the hashRef label")
+            && error_message.contains("Do not pass a direct file path"),
         "direct patch should explain hashRef requirement: {rejected:?}"
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "base\n");
@@ -2084,6 +2083,107 @@ async fn rg_plaintext_includes_matches_and_code_footer() {
 }
 
 #[tokio::test]
+async fn rg_content_defaults_to_session_workdir_for_local_search() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("small.txt");
+    std::fs::write(&file, "refs-local-workdir-marker\n").unwrap();
+
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_rg_workdir",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let no_path = call(
+        &ep,
+        "ses_rg_workdir",
+        "rg",
+        json!({"pattern":"refs-local-workdir-marker"}),
+    )
+    .await;
+    assert!(
+        no_path["error"].is_null(),
+        "rg without path failed: {:?}",
+        no_path["error"]
+    );
+    assert!(
+        text(&no_path).contains("small.txt:1:1:refs-local-workdir-marker"),
+        "rg without path should search the session workdir, got: {:?}",
+        text(&no_path)
+    );
+
+    let dot_path = call(
+        &ep,
+        "ses_rg_workdir",
+        "rg",
+        json!({"pattern":"refs-local-workdir-marker","path":"."}),
+    )
+    .await;
+    assert!(
+        dot_path["error"].is_null(),
+        "rg with path=. failed: {:?}",
+        dot_path["error"]
+    );
+    assert!(
+        text(&dot_path).contains("small.txt:1:1:refs-local-workdir-marker"),
+        "rg path=. should search the session workdir, got: {:?}",
+        text(&dot_path)
+    );
+}
+
+#[tokio::test]
+async fn rg_content_basename_globs_match_inside_directory_search() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let search_dir = dir.path().join("search-root");
+    std::fs::create_dir_all(&search_dir).unwrap();
+    std::fs::write(search_dir.join("small.txt"), "refs-glob-marker\n").unwrap();
+    std::fs::write(search_dir.join("other.txt"), "refs-glob-marker\n").unwrap();
+
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_rg_globs",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let response = call(
+        &ep,
+        "ses_rg_globs",
+        "rg",
+        json!({"pattern":"refs-glob-marker","path":"search-root","globs":["small.txt"]}),
+    )
+    .await;
+    assert!(
+        response["error"].is_null(),
+        "rg with basename glob failed: {:?}",
+        response["error"]
+    );
+    let output = text(&response);
+    assert!(
+        output.contains("small.txt:1:1:refs-glob-marker") && !output.contains("other.txt"),
+        "basename globs should recursively match small.txt only, got: {:?}",
+        output
+    );
+}
+
+#[tokio::test]
 async fn rg_files_mode_matches_paths_by_glob_pattern() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);
@@ -2179,6 +2279,8 @@ async fn executor_routing_with_two_executors() {
 
     let local_file = dir.path().join("local.rs");
     let remote_file = dir.path().join("remote.rs");
+    let remote_small_file = dir.path().join("remote-small.txt");
+    std::fs::write(&remote_small_file, "refs-remote-glob-marker\n").unwrap();
 
     let r = call(&ep, "exec_test", "FileAction", json!({"mode":"create","fileKey":local_file.to_string_lossy(),"content":"fn local() {}\n","executor":"local"})).await;
     assert!(
@@ -2287,6 +2389,25 @@ async fn executor_routing_with_two_executors() {
         r["error"]
     );
     assert!(text(&r).contains("remote.rs"));
+
+    let r = call(
+        &ep,
+        "exec_test",
+        "rg",
+        json!({
+            "pattern":"refs-remote-glob-marker",
+            "path":dir.path().to_string_lossy(),
+            "globs":["remote-small.txt"],
+            "executor":"exec_1"
+        }),
+    )
+    .await;
+    assert!(
+        r["error"].is_null(),
+        "rg content basename glob on exec_1 failed: {:?}",
+        r["error"]
+    );
+    assert!(text(&r).contains("remote-small.txt"));
 
     println!("executor routing test passed: local and exec_1 both work");
 }

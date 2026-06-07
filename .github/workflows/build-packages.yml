@@ -13,8 +13,30 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
   build:
     name: ${{ matrix.package }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

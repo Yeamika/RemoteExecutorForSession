@@ -63,9 +63,9 @@ struct ExbashTask {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
-    AttachInput,
-    AttachLink,
-    AttachCommand,
+    Input,
+    Link,
+    Command,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,13 +378,15 @@ async fn run_attach_inner(
         exit_code: exit_u32(&target.task),
         local_cols,
         local_rows,
-        mode: Mode::AttachInput,
+        mode: Mode::Input,
         command_target: CommandTarget::Input,
         ctrl_c_count: 0,
         message: None,
     };
-    let mut metrics = Metrics::default();
-    metrics.next_ping_seq = 1;
+    let mut metrics = Metrics {
+        next_ping_seq: 1,
+        ..Metrics::default()
+    };
     render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
 
     let mut ping_tick = time::interval_at(
@@ -414,13 +416,15 @@ async fn run_attach_inner(
                         match process_attach_key(
                             client,
                             key,
-                            &parser,
-                            &mut view,
-                            &target.task,
-                            &mut metrics,
-                            &mut out,
-                            &mut ws_write,
-                            &mut ctrl_c_streak,
+                            AttachKeyContext {
+                                parser: &parser,
+                                view: &mut view,
+                                task: &target.task,
+                                metrics: &mut metrics,
+                                out: &mut out,
+                                ws_write: &mut ws_write,
+                                ctrl_c_streak: &mut ctrl_c_streak,
+                            },
                         ).await? {
                             AttachActionRequest::Continue => {}
                             AttachActionRequest::List => return Ok(AttachAction::List),
@@ -490,19 +494,32 @@ enum AttachActionRequest {
     Quit,
 }
 
+struct AttachKeyContext<'a> {
+    parser: &'a vt100::Parser,
+    view: &'a mut AttachView,
+    task: &'a ExbashTask,
+    metrics: &'a mut Metrics,
+    out: &'a mut Stdout,
+    ws_write: &'a mut ClientWsSink,
+    ctrl_c_streak: &'a mut u8,
+}
+
 async fn process_attach_key(
     client: &RefsMcpClient,
     key: KeyEvent,
-    parser: &vt100::Parser,
-    view: &mut AttachView,
-    task: &ExbashTask,
-    metrics: &mut Metrics,
-    out: &mut Stdout,
-    ws_write: &mut ClientWsSink,
-    ctrl_c_streak: &mut u8,
+    context: AttachKeyContext<'_>,
 ) -> Result<AttachActionRequest> {
+    let AttachKeyContext {
+        parser,
+        view,
+        task,
+        metrics,
+        out,
+        ws_write,
+        ctrl_c_streak,
+    } = context;
     match view.mode {
-        Mode::AttachInput | Mode::AttachLink => {
+        Mode::Input | Mode::Link => {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             {
@@ -514,7 +531,7 @@ async fn process_attach_key(
                 if *ctrl_c_streak >= 3 {
                     *ctrl_c_streak = 0;
                     view.ctrl_c_count = 0;
-                    view.mode = Mode::AttachCommand;
+                    view.mode = Mode::Command;
                     view.command_target = CommandTarget::Input;
                 }
                 render_attach(out, parser, view, task, metrics)?;
@@ -526,10 +543,10 @@ async fn process_attach_key(
             view.ctrl_c_count = 0;
 
             if matches!(key.code, KeyCode::Tab) {
-                view.mode = if view.mode == Mode::AttachInput {
-                    Mode::AttachLink
+                view.mode = if view.mode == Mode::Input {
+                    Mode::Link
                 } else {
-                    Mode::AttachInput
+                    Mode::Input
                 };
                 let bytes = b"\t".to_vec();
                 metrics.record_tx(bytes.len());
@@ -547,21 +564,21 @@ async fn process_attach_key(
             }
             Ok(AttachActionRequest::Continue)
         }
-        Mode::AttachCommand => {
+        Mode::Command => {
             *ctrl_c_streak = 0;
             view.ctrl_c_count = 0;
             match key.code {
                 KeyCode::Esc => {
-                    view.mode = Mode::AttachInput;
+                    view.mode = Mode::Input;
                     view.command_target = CommandTarget::Input;
                 }
                 KeyCode::Enter => match view.command_target {
-                    CommandTarget::Input => view.mode = Mode::AttachInput,
+                    CommandTarget::Input => view.mode = Mode::Input,
                     CommandTarget::Identity => {
                         let msg = serde_json::to_string(&ClientText::RequestControl)?;
                         metrics.record_tx(msg.len());
                         ws_write.send(Message::Text(msg.into())).await?;
-                        view.mode = Mode::AttachInput;
+                        view.mode = Mode::Input;
                     }
                     CommandTarget::List => return Ok(AttachActionRequest::List),
                     CommandTarget::Stop => {
@@ -925,7 +942,7 @@ fn render_attach(
     } else {
         draw_attach_status(out, view, task, metrics)?;
     }
-    if view.mode == Mode::AttachCommand {
+    if view.mode == Mode::Command {
         queue!(
             out,
             cursor::MoveTo(0, view.local_rows.saturating_sub(1)),
@@ -950,17 +967,17 @@ fn draw_attach_status(
     let role = role_symbol(&view.role);
     let state = attach_state_icon(view, task);
     let body = match view.mode {
-        Mode::AttachInput if view.ctrl_c_count > 0 => {
+        Mode::Input if view.ctrl_c_count > 0 => {
             format!("[ctrl c x{}] x3 to command mode", view.ctrl_c_count)
         }
-        Mode::AttachInput => format!(
+        Mode::Input => format!(
             "[>] [{role}:{}]  {state} {}:{}  {}",
             view.id,
             task.executor,
             task.async_id,
             task_title(task)
         ),
-        Mode::AttachLink => format!(
+        Mode::Link => format!(
             "[~] [{role}:{}]  rtt={} rx={} tx={} idle={}  {state} {}:{}",
             view.id,
             metrics.latency_text(),
@@ -970,7 +987,7 @@ fn draw_attach_status(
             task.executor,
             task.async_id
         ),
-        Mode::AttachCommand => format!(
+        Mode::Command => format!(
             "[:] {}  {state} {}:{}",
             command_targets_text(view.command_target),
             task.executor,
@@ -1266,9 +1283,7 @@ fn trim_to_width(text: &str, width: usize) -> String {
 }
 
 fn single_line(text: &str) -> String {
-    text.replace("\r\n", "\\n")
-        .replace('\n', "\\n")
-        .replace('\r', "\\n")
+    text.replace("\r\n", "\\n").replace(['\n', '\r'], "\\n")
 }
 
 fn format_duration(duration: Duration) -> String {

@@ -642,6 +642,36 @@ fn require_patch_hash_ref(arguments: &Value) -> Result<(), JsonRpcError> {
     ))
 }
 
+fn normalize_file_action_patch_text(arguments: &mut Value) {
+    if optional_string_field(arguments, "mode").as_deref() != Some("patch") {
+        return;
+    }
+    let Some(object) = arguments.as_object_mut() else {
+        return;
+    };
+    let Some(text) = object.get("patchText").and_then(Value::as_str) else {
+        return;
+    };
+    let normalized = strip_unified_diff_file_header(text);
+    if normalized != text {
+        object.insert(
+            "patchText".to_string(),
+            Value::String(normalized.to_string()),
+        );
+    }
+}
+
+fn strip_unified_diff_file_header(text: &str) -> &str {
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("@@") {
+            return &text[offset..];
+        }
+        offset += line.len();
+    }
+    text
+}
+
 fn enable_hash_check_mode(arguments: &mut Value) {
     if let Some(object) = arguments.as_object_mut() {
         object
@@ -1184,6 +1214,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 };
                 if name == "FileAction" {
                     require_patch_hash_ref(&arguments)?;
+                    normalize_file_action_patch_text(&mut arguments);
                 }
                 // Resolve hashRef if present
                 let (mut args, file_key_ref) = self.resolve_file_args(&scope, arguments).await?;
@@ -1752,6 +1783,21 @@ mod tests {
             line,
             "- rex-remote running totalOutput=8 description=012345678901234567890123456789 command=abcdefghijklmnopqrstuvwxyz1234"
         );
+    }
+
+    #[test]
+    fn file_action_patch_text_discards_file_headers() {
+        let patch = "--- a/wrong.txt\n+++ b/also-wrong.txt\n@@ -1 +1,2 @@\n base\n+next\n";
+        assert_eq!(
+            strip_unified_diff_file_header(patch),
+            "@@ -1 +1,2 @@\n base\n+next\n"
+        );
+    }
+
+    #[test]
+    fn file_action_patch_text_without_hunk_is_unchanged() {
+        let patch = "--- a/wrong.txt\n+++ b/also-wrong.txt\nnot a patch";
+        assert_eq!(strip_unified_diff_file_header(patch), patch);
     }
 
     #[test]

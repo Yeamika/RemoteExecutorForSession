@@ -308,7 +308,7 @@ For `mode="patch"`, do not pass a direct path. First call `read` on the file, co
 +status: success
 +message: patch applied successfully
 ```
-Use the hashRef label from read/FileAction as fileKey."#,
+Do not include `diff --git`, `--- a/...`, or `+++ b/...` file headers; fileKey chooses the target file. If those headers are present, REFS discards them and ignores their paths, even when they do not match fileKey. Use the hashRef label from read/FileAction as fileKey."#,
                 ),
             ),
             prop(

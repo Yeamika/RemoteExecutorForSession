@@ -2034,7 +2034,7 @@ async fn file_action_patch_requires_hash_ref() {
         json!({
             "mode": "patch",
             "fileKey": file_ref,
-            "patchText": "@@ -1 +1,2 @@\n base\n+hashRef write\n",
+            "patchText": "--- a/wrong-file.txt\n+++ b/also-wrong-file.txt\n@@ -1 +1,2 @@\n base\n+hashRef write\n",
             "executor": "local"
         }),
     )

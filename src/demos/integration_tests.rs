@@ -2006,7 +2006,7 @@ async fn file_action_patch_requires_hash_ref() {
         }),
     )
     .await;
-    assert_eq!(invalid_patch["error"]["code"], json!(-32603));
+    assert_eq!(invalid_patch["error"]["code"], json!(-32602));
     assert!(
         invalid_patch["error"]["message"]
             .as_str()
@@ -2026,6 +2026,40 @@ async fn file_action_patch_requires_hash_ref() {
     assert!(read["error"].is_null(), "read failed: {:?}", read["error"]);
     let file_ref = file_ref_from_text(&text(&read))
         .unwrap_or_else(|| panic!("read did not return fileRef after invalid patch: {read:?}"));
+
+    let stale_count_patch = call(
+        &ep,
+        "ses_patch_hash_ref",
+        "FileAction",
+        json!({
+            "mode": "patch",
+            "fileKey": file_ref,
+            "patchText": "@@ -1 +1,3 @@\n base\n+next\n",
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert_eq!(stale_count_patch["error"]["code"], json!(-32602));
+    let stale_count_message = stale_count_patch["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        stale_count_message.contains("stale line counts")
+            && stale_count_message.contains("declares -1,1 +1,3")
+            && stale_count_message.contains("body contains -1,1 +1,2")
+            && stale_count_message.contains("@@ -1,1 +1,2 @@"),
+        "stale count patch should explain exact hunk mismatch: {stale_count_patch:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "base\n");
+
+    let read = call(
+        &ep,
+        "ses_patch_hash_ref",
+        "read",
+        json!({"fileKey": file.to_string_lossy(), "executor": "local"}),
+    )
+    .await;
+    assert!(read["error"].is_null(), "read failed: {:?}", read["error"]);
+    let file_ref = file_ref_from_text(&text(&read))
+        .unwrap_or_else(|| panic!("read did not return fileRef after stale patch: {read:?}"));
 
     let patched = call(
         &ep,

@@ -2127,6 +2127,76 @@ async fn rg_plaintext_includes_matches_and_code_footer() {
 }
 
 #[tokio::test]
+async fn rg_content_searches_multiple_paths() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let one = dir.path().join("one");
+    let two = dir.path().join("two");
+    let three = dir.path().join("three");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::create_dir_all(&three).unwrap();
+    std::fs::write(one.join("a.txt"), "refs-multi-marker one\n").unwrap();
+    std::fs::write(two.join("b.txt"), "refs-multi-marker two\n").unwrap();
+    std::fs::write(three.join("c.txt"), "refs-multi-marker three\n").unwrap();
+
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_rg_multi",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let paths_array = call(
+        &ep,
+        "ses_rg_multi",
+        "rg",
+        json!({"pattern":"refs-multi-marker","paths":["one","two"],"max_count":120}),
+    )
+    .await;
+    assert!(
+        paths_array["error"].is_null(),
+        "rg paths array failed: {:?}",
+        paths_array["error"]
+    );
+    let output = text(&paths_array);
+    assert!(
+        output.contains("one/a.txt:1:1:refs-multi-marker one")
+            && output.contains("two/b.txt:1:1:refs-multi-marker two")
+            && output.ends_with("matches:2\nfilesWalked:2\ncode:0"),
+        "rg paths array should merge output and footer, got: {output:?}"
+    );
+
+    let spaced_path = format!("{} {}", one.to_string_lossy(), two.to_string_lossy());
+    let spaced_paths = call(
+        &ep,
+        "ses_rg_multi",
+        "rg",
+        json!({"pattern":"refs-multi-marker","path":spaced_path,"max_count":1}),
+    )
+    .await;
+    assert!(
+        spaced_paths["error"].is_null(),
+        "rg spaced paths failed: {:?}",
+        spaced_paths["error"]
+    );
+    let output = text(&spaced_paths);
+    assert!(
+        output.contains("one/a.txt:1:1:refs-multi-marker one")
+            && !output.contains("two/b.txt")
+            && output.ends_with("matches:1\nfilesWalked:1\ncode:0"),
+        "rg spaced paths should split absolute paths and honor max_count, got: {output:?}"
+    );
+}
+
+#[tokio::test]
 async fn rg_content_defaults_to_session_workdir_for_local_search() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);

@@ -29,6 +29,12 @@ enum RgMode {
     Files,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RgPathList {
+    Single,
+    Multi(Vec<String>),
+}
+
 pub async fn create_session_mcp<H: SessionHost + 'static>(
     _ctx: ToolContext,
     host: Arc<H>,
@@ -1054,6 +1060,159 @@ fn prepare_rg_arguments(scope: &CallScope, mode: RgMode, arguments: &mut Value) 
     expand_basename_globs(arguments);
 }
 
+fn extract_rg_paths(arguments: &mut Value) -> RgPathList {
+    let Some(object) = arguments.as_object_mut() else {
+        return RgPathList::Single;
+    };
+    if let Some(paths) = object.remove("paths").and_then(|value| match value {
+        Value::Array(values) => Some(
+            values
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>(),
+        ),
+        Value::String(value) => Some(split_rg_path_list(&value, true)),
+        _ => None,
+    }) {
+        if paths.len() > 1 {
+            object.remove("path");
+            return RgPathList::Multi(paths);
+        }
+        if let Some(path) = paths.into_iter().next() {
+            object.insert("path".to_string(), Value::String(path));
+        }
+        return RgPathList::Single;
+    }
+
+    let Some(path) = object.get("path").and_then(Value::as_str) else {
+        return RgPathList::Single;
+    };
+    let paths = split_rg_path_list(path, false);
+    if paths.len() <= 1 {
+        return RgPathList::Single;
+    }
+    object.remove("path");
+    RgPathList::Multi(paths)
+}
+
+fn split_rg_path_list(path: &str, explicit_multi: bool) -> Vec<String> {
+    let values = path
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if values.len() <= 1
+        || (!explicit_multi && !values.iter().all(|value| looks_like_absolute_path(value)))
+    {
+        return vec![path.trim().to_string()]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect();
+    }
+    values
+}
+
+fn looks_like_absolute_path(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with('\\')
+        || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+}
+
+async fn call_rg_paths<H: SessionHost + 'static>(
+    handler: &SessionMcpHandler<H>,
+    scope: &CallScope,
+    method: &str,
+    mut args: Value,
+    paths: RgPathList,
+) -> Result<Value, JsonRpcError> {
+    let RgPathList::Multi(paths) = paths else {
+        return handler.call_executor_tool(scope, method, args).await;
+    };
+    let mut results = Vec::new();
+    let mut remaining = args
+        .get("max_count")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    for path in paths {
+        if remaining == Some(0) {
+            break;
+        }
+        if let Some(object) = args.as_object_mut() {
+            object.insert("path".to_string(), Value::String(path));
+            if let Some(remaining) = remaining {
+                object.insert("max_count".to_string(), json!(remaining));
+            }
+        }
+        let result = handler
+            .call_executor_tool(scope, method, args.clone())
+            .await?;
+        if let Some(value) = remaining.as_mut() {
+            *value = value.saturating_sub(rg_result_match_count(&result));
+        }
+        results.push(result);
+    }
+    Ok(merge_rg_results(results))
+}
+
+fn rg_result_match_count(result: &Value) -> usize {
+    result
+        .pointer("/metadata/matches")
+        .or_else(|| result.pointer("/metadata/count"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
+fn merge_rg_results(results: Vec<Value>) -> Value {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut matches = 0u64;
+    let mut files_walked = 0u64;
+    let mut timed_out = false;
+    let mut count = 0u64;
+    for result in results {
+        if let Some(text) = result.pointer("/output/text").and_then(Value::as_str) {
+            stdout.push_str(text);
+            if !stdout.is_empty() && !stdout.ends_with('\n') {
+                stdout.push('\n');
+            }
+        }
+        if let Some(text) = result.pointer("/metadata/stderr").and_then(Value::as_str) {
+            stderr.push_str(text);
+        }
+        matches += result
+            .pointer("/metadata/matches")
+            .or_else(|| result.pointer("/metadata/count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        files_walked += result
+            .pointer("/metadata/filesWalked")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        timed_out |= result
+            .pointer("/metadata/timedOut")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        count += result
+            .pointer("/metadata/count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+    }
+    json!({
+        "output": { "text": stdout },
+        "metadata": {
+            "stdout": stdout,
+            "stderr": stderr,
+            "matches": matches,
+            "filesWalked": files_walked,
+            "timedOut": timed_out,
+            "code": if matches > 0 { 0 } else { 1 },
+            "count": count,
+        }
+    })
+}
+
 fn expand_basename_globs(arguments: &mut Value) {
     let Some(globs) = arguments
         .as_object_mut()
@@ -1525,9 +1684,10 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 };
                 let mut call_args = arguments;
                 prepare_rg_arguments(&scope, mode, &mut call_args);
+                let paths = extract_rg_paths(&mut call_args);
                 remove_field(&mut call_args, "mode");
                 remove_field(&mut call_args, "type");
-                let result = self.call_executor_tool(&scope, method, call_args).await?;
+                let result = call_rg_paths(self, &scope, method, call_args, paths).await?;
                 let result = match mode {
                     RgMode::Content => result,
                     RgMode::Files => normalize_rg_files_result(result),
@@ -2006,6 +2166,32 @@ mod tests {
                 "**/*.rs"
             ])
         );
+    }
+
+    #[test]
+    fn rg_extracts_paths_array() {
+        let mut args = json!({ "paths": ["one", "two"], "path": "ignored" });
+        assert_eq!(
+            extract_rg_paths(&mut args),
+            RgPathList::Multi(vec!["one".to_string(), "two".to_string()])
+        );
+        assert!(args.get("path").is_none());
+    }
+
+    #[test]
+    fn rg_splits_whitespace_separated_absolute_path() {
+        let mut args = json!({ "path": "/one /two" });
+        assert_eq!(
+            extract_rg_paths(&mut args),
+            RgPathList::Multi(vec!["/one".to_string(), "/two".to_string()])
+        );
+    }
+
+    #[test]
+    fn rg_keeps_single_path_with_spaces() {
+        let mut args = json!({ "path": "dir with spaces" });
+        assert_eq!(extract_rg_paths(&mut args), RgPathList::Single);
+        assert_eq!(args["path"], "dir with spaces");
     }
 
     #[test]

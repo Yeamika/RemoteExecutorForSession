@@ -559,7 +559,7 @@ pub fn read() -> McpToolDef {
 pub fn rg() -> McpToolDef {
     tool_def(
         "rg",
-        "REC rg search. mode=content searches file contents and returns matching lines. mode=files matches file paths by glob pattern and returns paths. Local content searches with no path or path='.' are rooted at the current session workdir. In content mode, basename globs such as `small.txt` are matched recursively like `**/small.txt`. `timeout` is a soft search deadline in milliseconds: default 10000, -1 disables it, and timeout returns collected results instead of an error. Search results are paths, not hashRefs; call `read` on a path first when a later edit should use a stale-safe `fileKey`.",
+        "REC rg search. mode=content searches file contents and returns matching lines. mode=files matches file paths by glob pattern and returns paths. Use `path` for one file/directory or `paths` for multiple files/directories. Local content searches with no path or path='.' are rooted at the current session workdir. In content mode, basename globs such as `small.txt` are matched recursively like `**/small.txt`. `timeout` is a soft search deadline in milliseconds: default 10000, -1 disables it, and timeout returns collected results instead of an error. Search results are paths, not hashRefs; call `read` on a path first when a later edit should use a stale-safe `fileKey`.",
         vec!["pattern"],
         vec![
             exec_session_prop(),
@@ -586,7 +586,8 @@ pub fn rg() -> McpToolDef {
                     "content mode: regex pattern to search for. files mode: glob pattern such as `*.rs` or `src/**/*.ts`.",
                 ),
             ),
-            prop("path", string_prop("Specific file or directory to search. In local content mode, omit or use `.` to search the current session workdir.")),
+            prop("path", string_prop("Specific file or directory to search. In local content mode, omit or use `.` to search the current session workdir. For multiple paths, prefer `paths`; whitespace-separated absolute paths in `path` are also accepted for compatibility.")),
+            prop("paths", array_string_desc("Specific files or directories to search. REFS runs rg once per path and merges the output.")),
             prop("globs", array_string_desc("Content mode file glob filters. Basename globs such as `small.txt` also match recursively.")),
             prop(
                 "case_sensitive",

@@ -7,7 +7,8 @@ use tempfile::TempDir;
 
 use crate::demos::memory_host::MemorySessionHost;
 use crate::host::{
-    ExbashSessionStore, ExbashSyncInput, ExbashWorkdirStore, EXBASH_TASK_STACK_FULL_MESSAGE,
+    ExbashSessionStore, ExbashSyncInput, ExbashWorkdirStore, RemoteExecutorConfigStore,
+    EXBASH_TASK_STACK_FULL_MESSAGE,
 };
 use crate::jsonrpc::{JsonRpcEndpoint, JsonRpcHandler};
 use crate::mcp::{create_session_mcp_with_manager, EXECUTOR_SESSION_PARAM};
@@ -96,6 +97,29 @@ fn executor_name(i: usize) -> &'static str {
         3 => "exec_3",
         _ => "local",
     }
+}
+
+fn remote_executor_config(url: &str) -> Value {
+    let executors = (1..EXECUTOR_COUNT)
+        .map(|i| {
+            json!({
+                "id": executor_name(i),
+                "url": url,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "executors": executors })
+}
+
+fn one_remote_executor_config(id: &str, url: &str) -> Value {
+    json!({
+        "executors": [
+            {
+                "id": id,
+                "url": url,
+            }
+        ]
+    })
 }
 
 async fn call(
@@ -1015,22 +1039,7 @@ async fn stress_rpc_64x16_parallel() {
         .as_str()
         .unwrap()
         .to_string();
-    for i in 1..EXECUTOR_COUNT {
-        let r = crate::rec::manager_handle(&caller, serde_json::from_value(json!({"id":i+1,"tool":"connect_to_executor","params":{"id":executor_name(i),"url":url}})).unwrap()).await;
-        assert!(r.ok);
-    }
-    let all = crate::rec::manager_handle(
-        &caller,
-        serde_json::from_value(json!({"id":999,"tool":"list_executor","params":{}})).unwrap(),
-    )
-    .await;
-    assert_eq!(
-        serde_json::to_value(&all.result).unwrap()["metadata"]["executors"]
-            .as_array()
-            .unwrap()
-            .len(),
-        EXECUTOR_COUNT
-    );
+    let exec_config = remote_executor_config(&url);
 
     // === 8 dirs, 64 sessions (shared Caller + ShellManager) ===
     let dirs: Vec<TempDir> = (0..DIR_COUNT)
@@ -1045,6 +1054,9 @@ async fn stress_rpc_64x16_parallel() {
             format!("ses_{:04}", i),
             dirs[d].path().to_string_lossy(),
         ));
+        host.update_remote_executor_config(&dirs[d].path().to_string_lossy(), exec_config.clone())
+            .await
+            .unwrap();
         let ctx = ToolContext::new(Some(dirs[d].path().to_path_buf()));
         eps.push(JsonRpcEndpoint::new(create_session_mcp_with_manager(
             ctx,
@@ -1707,21 +1719,6 @@ async fn exbash_cleanup_syncs_host_tracking() {
         .as_str()
         .unwrap()
         .to_string();
-    let connect_remote = crate::rec::manager_handle(
-        &caller,
-        serde_json::from_value(json!({
-            "id": 2,
-            "tool": "connect_to_executor",
-            "params": { "id": "exec_cleanup", "url": remote_url }
-        }))
-        .unwrap(),
-    )
-    .await;
-    assert!(
-        connect_remote.ok,
-        "connect exec_cleanup failed: {:?}",
-        connect_remote.error
-    );
     let shared_manager = Arc::new(caller);
     let shell_manager = ShellManager::default_shell(80, 24);
     let dir = tempfile::tempdir().unwrap();
@@ -1729,6 +1726,12 @@ async fn exbash_cleanup_syncs_host_tracking() {
         "ses_exbash_cleanup",
         dir.path().to_string_lossy(),
     ));
+    host.update_remote_executor_config(
+        &dir.path().to_string_lossy(),
+        one_remote_executor_config("exec_cleanup", &remote_url),
+    )
+    .await
+    .unwrap();
     let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
     let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
         ctx,
@@ -1883,6 +1886,13 @@ async fn exbash_cleanup_syncs_host_tracking() {
         "ses_exbash_cleanup_other",
         dir.path().to_string_lossy(),
     ));
+    other_host
+        .update_remote_executor_config(
+            &dir.path().to_string_lossy(),
+            one_remote_executor_config("exec_cleanup", &remote_url),
+        )
+        .await
+        .unwrap();
     let other_ctx = ToolContext::new(Some(dir.path().to_path_buf()));
     let other_ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
         other_ctx,
@@ -2011,6 +2021,146 @@ async fn exbash_cleanup_syncs_host_tracking() {
         "stale remote remove should clear host tracking through MCP, got: {:?}",
         remote_list_text
     );
+}
+
+#[tokio::test]
+async fn manager_executor_config_uses_workspace_host_store() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_manager_config",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host.clone(),
+        shared_manager,
+        shell_manager,
+    ));
+
+    let list = call_structured(
+        &ep,
+        "ses_manager_config",
+        "RemoteExecutorManager",
+        json!({"method":"list_executor"}),
+    )
+    .await;
+    assert!(list["error"].is_null(), "initial list failed: {list:?}");
+    assert_eq!(meta(&list)["metadata"]["default"], "local");
+    assert_eq!(
+        meta(&list)["metadata"]["executors"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let connect = call_structured(
+        &ep,
+        "ses_manager_config",
+        "RemoteExecutorManager",
+        json!({
+            "method":"connect_to_executor",
+            "id":"exec_cfg",
+            "url":"127.0.0.1:65535",
+            "system":"linux",
+            "device":"cfg-device",
+            "labels":{"role":"test"}
+        }),
+    )
+    .await;
+    assert!(connect["error"].is_null(), "connect failed: {connect:?}");
+    let output = text(&connect);
+    assert!(
+        output.contains("- exec_cfg")
+            && output.contains("url=ws://127.0.0.1:65535")
+            && output.contains("labels=role=test"),
+        "{output}"
+    );
+    let stored = host
+        .read_remote_executor_config(&dir.path().to_string_lossy())
+        .await
+        .unwrap()
+        .config;
+    assert_eq!(stored["default"], "local");
+    assert_eq!(stored["executors"][0]["id"], "exec_cfg");
+    assert_eq!(stored["executors"][0]["url"], "ws://127.0.0.1:65535");
+
+    let set = call_structured(
+        &ep,
+        "ses_manager_config",
+        "RemoteExecutorManager",
+        json!({"method":"set_default_executor","id":"exec_cfg"}),
+    )
+    .await;
+    assert!(set["error"].is_null(), "set default failed: {set:?}");
+    assert_eq!(meta(&set)["metadata"]["default"], "exec_cfg");
+    let stored = host
+        .read_remote_executor_config(&dir.path().to_string_lossy())
+        .await
+        .unwrap()
+        .config;
+    assert_eq!(stored["default"], "exec_cfg");
+}
+
+#[tokio::test]
+async fn manager_executor_config_normalizes_legacy_array_on_write() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_manager_legacy_config",
+        dir.path().to_string_lossy(),
+    ));
+    host.update_remote_executor_config(
+        &dir.path().to_string_lossy(),
+        json!([
+            {
+                "id": "legacy_exec",
+                "url": "ws://127.0.0.1:65535"
+            }
+        ]),
+    )
+    .await
+    .unwrap();
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host.clone(),
+        shared_manager,
+        shell_manager,
+    ));
+
+    let list = call_structured(
+        &ep,
+        "ses_manager_legacy_config",
+        "RemoteExecutorManager",
+        json!({"method":"list_executor"}),
+    )
+    .await;
+    assert!(list["error"].is_null(), "legacy list failed: {list:?}");
+    assert_eq!(meta(&list)["metadata"]["default"], "local");
+    assert!(text(&list).contains("legacy_exec"));
+
+    let set = call_structured(
+        &ep,
+        "ses_manager_legacy_config",
+        "RemoteExecutorManager",
+        json!({"method":"set_default_executor","id":"legacy_exec"}),
+    )
+    .await;
+    assert!(set["error"].is_null(), "legacy set failed: {set:?}");
+    let stored = host
+        .read_remote_executor_config(&dir.path().to_string_lossy())
+        .await
+        .unwrap()
+        .config;
+    assert_eq!(stored["default"], "legacy_exec");
+    assert_eq!(stored["executors"][0]["id"], "legacy_exec");
 }
 
 #[tokio::test]
@@ -2635,29 +2785,6 @@ async fn executor_routing_with_two_executors() {
         .unwrap()
         .to_string();
 
-    let connect = crate::rec::manager_handle(
-        &caller1,
-        serde_json::from_value(
-            json!({"id":2,"tool":"connect_to_executor","params":{"id":"exec_1","url":url2}}),
-        )
-        .unwrap(),
-    )
-    .await;
-    assert!(connect.ok, "connect exec_1 failed: {:?}", connect.error);
-
-    let list1 = crate::rec::manager_handle(
-        &caller1,
-        serde_json::from_value(json!({"id":3,"tool":"list_executor","params":{}})).unwrap(),
-    )
-    .await;
-    let execs = serde_json::to_value(&list1.result).unwrap()["metadata"]["executors"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert_eq!(execs.len(), 2);
-    assert!(execs.iter().any(|e| e["id"] == "local"));
-    assert!(execs.iter().any(|e| e["id"] == "exec_1"));
-
     let shared = Arc::new(caller1);
     let shell = ShellManager::default_shell(80, 24);
     let dir = tempfile::tempdir().unwrap();
@@ -2667,6 +2794,26 @@ async fn executor_routing_with_two_executors() {
     ));
     let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
     let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(ctx, host, shared, shell));
+
+    let connect = call_structured(
+        &ep,
+        "exec_test",
+        "RemoteExecutorManager",
+        json!({"method":"connect_to_executor","id":"exec_1","url":url2}),
+    )
+    .await;
+    assert!(
+        connect["error"].is_null(),
+        "connect exec_1 failed: {:?}",
+        connect["error"]
+    );
+    let execs = meta(&connect)["metadata"]["executors"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(execs.len(), 2);
+    assert!(execs.iter().any(|e| e["id"] == "local"));
+    assert!(execs.iter().any(|e| e["id"] == "exec_1"));
 
     let local_file = dir.path().join("local.rs");
     let remote_file = dir.path().join("remote.rs");

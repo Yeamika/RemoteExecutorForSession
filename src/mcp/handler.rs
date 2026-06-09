@@ -4,12 +4,16 @@ use crate::mcp::{
     EmbeddedMcp, McpCallContext, McpCallResult, McpContentText, McpToolDef, McpToolHandler,
     EXECUTOR_SESSION_PARAM,
 };
-use crate::rec::{manager_handle, new_manager, Caller, ExecutorRequest, ShellManager, ToolContext};
+use crate::rec::{
+    manager_handle, new_manager, Caller, ConnectExecutorOptions, ExecutorRequest, ShellManager,
+    ToolContext,
+};
 use crate::refs::{extract_file_ref_update, inject_file_ref, parse_hash_ref};
 use crate::types::ExbashTaskSnapshot;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +43,24 @@ enum RgMode {
 enum RgPathList {
     Single,
     Multi(Vec<String>),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkspaceExecutorInfo {
+    id: String,
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceExecutorConfig {
+    default_executor: String,
+    executors: Vec<WorkspaceExecutorInfo>,
 }
 
 pub async fn create_session_mcp<H: SessionHost + 'static>(
@@ -101,6 +123,149 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         Ok(CallScope {
             session_id,
             workdir,
+        })
+    }
+
+    fn manager(&self) -> Result<SharedManager, JsonRpcError> {
+        self.manager
+            .get()
+            .ok_or_else(|| {
+                JsonRpcError::internal("RemoteExecutorManager runtime is not initialized")
+            })
+            .cloned()
+    }
+
+    async fn read_workspace_executor_config(
+        &self,
+        scope: &CallScope,
+    ) -> Result<WorkspaceExecutorConfig, JsonRpcError> {
+        let snapshot = self
+            .host
+            .read_remote_executor_config(&scope.workdir)
+            .await
+            .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+        Ok(workspace_executor_config_from_value(snapshot.config))
+    }
+
+    async fn write_workspace_executor_config(
+        &self,
+        scope: &CallScope,
+        config: &WorkspaceExecutorConfig,
+    ) -> Result<(), JsonRpcError> {
+        self.host
+            .update_remote_executor_config(
+                &scope.workdir,
+                workspace_executor_config_to_value(config),
+            )
+            .await
+            .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn sync_workspace_executor(
+        &self,
+        scope: &CallScope,
+        executor: &str,
+    ) -> Result<(), JsonRpcError> {
+        if executor == "local" {
+            return Ok(());
+        }
+        let config = self.read_workspace_executor_config(scope).await?;
+        let Some(item) = config.executors.iter().find(|item| item.id == executor) else {
+            return Err(JsonRpcError::internal(format!(
+                "executor not found in workspace config: {executor}"
+            )));
+        };
+        self.manager()?
+            .connect_to_executor(ConnectExecutorOptions {
+                id: item.id.clone(),
+                url: item.url.clone(),
+                system: item.system.clone(),
+                device: item.device.clone(),
+                labels: item.labels.clone(),
+            })
+            .await
+            .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn sync_workspace_executor_default(
+        &self,
+        config: &WorkspaceExecutorConfig,
+    ) -> Result<(), JsonRpcError> {
+        for item in &config.executors {
+            self.manager()?
+                .connect_to_executor(ConnectExecutorOptions {
+                    id: item.id.clone(),
+                    url: item.url.clone(),
+                    system: item.system.clone(),
+                    device: item.device.clone(),
+                    labels: item.labels.clone(),
+                })
+                .await
+                .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+        }
+        self.manager()?
+            .set_default_executor(&config.default_executor)
+            .await
+            .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn call_workspace_executor_manager(
+        &self,
+        scope: &CallScope,
+        method: &str,
+        mut arguments: Value,
+    ) -> Result<McpCallResult, JsonRpcError> {
+        remove_executor_session_id(&mut arguments);
+        remove_field(&mut arguments, "executor");
+        remove_field(&mut arguments, "method");
+
+        let result = match method {
+            "list_executor" => {
+                let config = self.read_workspace_executor_config(scope).await?;
+                workspace_executor_result(&config)
+            }
+            "connect_to_executor" => {
+                let mut config = self.read_workspace_executor_config(scope).await?;
+                let item = workspace_executor_from_arguments(&arguments)?;
+                upsert_workspace_executor(&mut config, item.clone());
+                self.write_workspace_executor_config(scope, &config).await?;
+                self.manager()?
+                    .connect_to_executor(ConnectExecutorOptions {
+                        id: item.id,
+                        url: item.url,
+                        system: item.system,
+                        device: item.device,
+                        labels: item.labels,
+                    })
+                    .await
+                    .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+                workspace_executor_result(&config)
+            }
+            "set_default_executor" => {
+                let mut config = self.read_workspace_executor_config(scope).await?;
+                let id = optional_string_field(&arguments, "id")
+                    .or_else(|| optional_string_field(&arguments, "targetExecutor"))
+                    .ok_or_else(|| JsonRpcError::invalid_params("executor id is required"))?;
+                if id != "local" && !config.executors.iter().any(|item| item.id == id) {
+                    return Err(JsonRpcError::internal(format!("executor not found: {id}")));
+                }
+                config.default_executor = id;
+                self.write_workspace_executor_config(scope, &config).await?;
+                self.sync_workspace_executor_default(&config).await?;
+                workspace_executor_result(&config)
+            }
+            _ => return Err(JsonRpcError::method_not_found(method)),
+        };
+        let output_text = extract_output_text(&result);
+        Ok(McpCallResult {
+            content: vec![McpContentText {
+                kind: "text".to_string(),
+                text: output_text,
+            }],
+            structured_content: Some(strip_output(result)),
         })
     }
 
@@ -494,11 +659,8 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         // Remove executor from arguments (it goes into ExecutorRequest)
         remove_field(&mut arguments, "executor");
 
-        let manager = self
-            .manager
-            .get()
-            .ok_or_else(|| JsonRpcError::internal("RemoteExecutorManager is not initialized"))?
-            .clone();
+        self.sync_workspace_executor(scope, &executor).await?;
+        let manager = self.manager()?;
         let directory = if executor == "local" {
             Some(PathBuf::from(&scope.workdir))
         } else {
@@ -756,6 +918,134 @@ fn extract_executor(arguments: &mut Value) -> String {
         .and_then(|v| v.as_str().map(str::to_string))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "local".to_string())
+}
+
+fn workspace_executor_config_from_value(value: Value) -> WorkspaceExecutorConfig {
+    let (default, entries) = match value {
+        Value::Array(entries) => ("local".to_string(), entries),
+        Value::Object(mut object) => {
+            let default = object
+                .remove("default")
+                .and_then(|value| value.as_str().map(str::to_string))
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "local".to_string());
+            let entries = object
+                .remove("executors")
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default();
+            (default, entries)
+        }
+        _ => ("local".to_string(), Vec::new()),
+    };
+    let mut seen = HashSet::new();
+    let executors = entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value::<WorkspaceExecutorInfo>(entry).ok())
+        .filter(|entry| {
+            !entry.id.trim().is_empty()
+                && entry.id != "local"
+                && !entry.url.trim().is_empty()
+                && seen.insert(entry.id.clone())
+        })
+        .collect::<Vec<_>>();
+    let default_executor =
+        if default == "local" || executors.iter().any(|entry| entry.id == default) {
+            default
+        } else {
+            "local".to_string()
+        };
+    WorkspaceExecutorConfig {
+        default_executor,
+        executors,
+    }
+}
+
+fn workspace_executor_config_to_value(config: &WorkspaceExecutorConfig) -> Value {
+    json!({
+        "default": config.default_executor,
+        "executors": config.executors,
+    })
+}
+
+fn workspace_executor_metadata(config: &WorkspaceExecutorConfig) -> Value {
+    let mut executors = vec![json!({ "id": "local" })];
+    executors.extend(
+        config
+            .executors
+            .iter()
+            .map(|entry| serde_json::to_value(entry).unwrap_or_else(|_| json!({}))),
+    );
+    json!({
+        "default": config.default_executor,
+        "executors": executors,
+    })
+}
+
+fn workspace_executor_result(config: &WorkspaceExecutorConfig) -> Value {
+    let metadata = workspace_executor_metadata(config);
+    let text = executor_list_output_text(&json!({ "metadata": metadata.clone() }))
+        .unwrap_or_else(|| "executors:\n- none".to_string());
+    json!({
+        "metadata": metadata,
+        "output": {
+            "message": "",
+            "text": text,
+            "info": "",
+        }
+    })
+}
+
+fn workspace_executor_from_arguments(
+    arguments: &Value,
+) -> Result<WorkspaceExecutorInfo, JsonRpcError> {
+    let id = optional_string_field(arguments, "id")
+        .ok_or_else(|| JsonRpcError::invalid_params("executor id is required"))?;
+    if id == "local" {
+        return Err(JsonRpcError::invalid_params("local executor is reserved"));
+    }
+    let url = optional_string_field(arguments, "url")
+        .ok_or_else(|| JsonRpcError::invalid_params("executor url is required"))?;
+    Ok(WorkspaceExecutorInfo {
+        id,
+        url: normalize_workspace_executor_url(&url),
+        system: optional_string_field(arguments, "system"),
+        device: optional_string_field(arguments, "device"),
+        labels: workspace_executor_labels(arguments.get("labels")),
+    })
+}
+
+fn workspace_executor_labels(value: Option<&Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_workspace_executor_url(url: &str) -> String {
+    if url.starts_with("ws://") || url.starts_with("wss://") {
+        url.to_string()
+    } else {
+        format!("ws://{url}")
+    }
+}
+
+fn upsert_workspace_executor(config: &mut WorkspaceExecutorConfig, entry: WorkspaceExecutorInfo) {
+    if let Some(existing) = config
+        .executors
+        .iter_mut()
+        .find(|existing| existing.id == entry.id)
+    {
+        *existing = entry;
+        return;
+    }
+    config.executors.push(entry);
 }
 
 fn remove_executor_session_id(arguments: &mut Value) {
@@ -1534,7 +1824,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
     async fn call_tool(
         &self,
         name: &str,
-        mut arguments: Value,
+        arguments: Value,
         context: McpCallContext,
     ) -> Result<McpCallResult, JsonRpcError> {
         let scope = self.scope(context).await?;
@@ -1757,6 +2047,14 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                if matches!(
+                    method.as_str(),
+                    "list_executor" | "connect_to_executor" | "set_default_executor"
+                ) {
+                    return self
+                        .call_workspace_executor_manager(&scope, &method, arguments)
+                        .await;
+                }
                 if method == "list_shells"
                     || method == "set_executor_shell"
                     || method == "request_reload"
@@ -1794,36 +2092,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                         structured_content: Some(strip_output(result)),
                     });
                 }
-                // Other manager methods go through Caller
-                let executor = extract_executor(&mut arguments);
-                remove_executor_session_id(&mut arguments);
-                remove_field(&mut arguments, "executor");
-                remove_field(&mut arguments, "method");
-                let manager = self
-                    .manager
-                    .get()
-                    .ok_or_else(|| {
-                        JsonRpcError::internal("RemoteExecutorManager is not initialized")
-                    })?
-                    .clone();
-                let request = ExecutorRequest {
-                    id: Value::Number(1.into()),
-                    method,
-                    executor: Some(executor),
-                    params: arguments,
-                    directory: None,
-                    tool_timeout_ms: None,
-                };
-                let response = manager_handle(&manager, request).await;
-                let result = serde_json::to_value(&response).unwrap();
-                let output_text = manager_output_text(&result);
-                Ok(McpCallResult {
-                    content: vec![McpContentText {
-                        kind: "text".to_string(),
-                        text: output_text,
-                    }],
-                    structured_content: Some(strip_output(result)),
-                })
+                Err(JsonRpcError::method_not_found(&method))
             }
             unknown => Err(JsonRpcError::method_not_found(unknown)),
         }
@@ -1848,19 +2117,6 @@ fn extract_output_text(result: &Value) -> String {
         }
         _ => "".to_string(),
     }
-}
-
-fn manager_output_text(result: &Value) -> String {
-    let text = result
-        .get("result")
-        .and_then(executor_list_output_text)
-        .or_else(|| {
-            result
-                .get("result")
-                .map(extract_output_text)
-                .filter(|text| !text.is_empty())
-        });
-    text.unwrap_or_else(|| serde_json::to_string_pretty(result).unwrap_or_default())
 }
 
 fn executor_list_output_text(result: &Value) -> Option<String> {

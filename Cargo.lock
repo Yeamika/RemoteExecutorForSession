@@ -733,7 +733,7 @@ dependencies = [
 [[package]]
 name = "pty_t_core"
 version = "0.1.0"
-source = "git+https://github.com/Yeamika/RemoteExecutor.git?branch=main#cbdc25a26a501ed2b5b4e7db8d3eafff32edc145"
+source = "git+https://github.com/Yeamika/RemoteExecutor.git?branch=main#8a3511387538e46f242010a995a564209993f210"
 dependencies = [
  "anyhow",
  "portable-pty",
@@ -745,7 +745,7 @@ dependencies = [
 [[package]]
 name = "pty_t_protocol"
 version = "0.1.0"
-source = "git+https://github.com/Yeamika/RemoteExecutor.git?branch=main#cbdc25a26a501ed2b5b4e7db8d3eafff32edc145"
+source = "git+https://github.com/Yeamika/RemoteExecutor.git?branch=main#8a3511387538e46f242010a995a564209993f210"
 dependencies = [
  "serde",
 ]
@@ -822,8 +822,8 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "remote_executor"
-version = "0.2.2"
-source = "git+https://github.com/Yeamika/RemoteExecutor.git?branch=main#cbdc25a26a501ed2b5b4e7db8d3eafff32edc145"
+version = "0.2.4"
+source = "git+https://github.com/Yeamika/RemoteExecutor.git?branch=main#8a3511387538e46f242010a995a564209993f210"
 dependencies = [
  "anyhow",
  "clap",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "remote_executor_for_session"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",

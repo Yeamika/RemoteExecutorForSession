@@ -135,6 +135,41 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             .cloned()
     }
 
+    async fn local_executor_metadata(&self) -> Result<Value, JsonRpcError> {
+        let response = manager_handle(
+            self.manager()?.as_ref(),
+            ExecutorRequest {
+                id: json!("list-local-executor"),
+                method: "list_executor".to_string(),
+                executor: None,
+                params: json!({}),
+                directory: None,
+                tool_timeout_ms: None,
+            },
+        )
+        .await;
+        if !response.ok {
+            return Err(JsonRpcError::internal(
+                response
+                    .error
+                    .unwrap_or_else(|| "list_executor failed".to_string()),
+            ));
+        }
+        let Some(result) = response.result.as_ref() else {
+            return Ok(json!({ "id": "local" }));
+        };
+        Ok(result
+            .pointer("/metadata/executors")
+            .and_then(Value::as_array)
+            .and_then(|executors| {
+                executors.iter().find_map(|executor| {
+                    (executor.get("id").and_then(Value::as_str) == Some("local"))
+                        .then(|| executor.clone())
+                })
+            })
+            .unwrap_or_else(|| json!({ "id": "local" })))
+    }
+
     async fn read_workspace_executor_config(
         &self,
         scope: &CallScope,
@@ -202,7 +237,8 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         let result = match method {
             "list_executor" => {
                 let config = self.read_workspace_executor_config(scope).await?;
-                workspace_executor_result(&config)
+                let local = self.local_executor_metadata().await?;
+                workspace_executor_result(&config, local)
             }
             "connect_to_executor" => {
                 let mut config = self.read_workspace_executor_config(scope).await?;
@@ -219,7 +255,8 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
                     })
                     .await
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?;
-                workspace_executor_result(&config)
+                let local = self.local_executor_metadata().await?;
+                workspace_executor_result(&config, local)
             }
             _ => return Err(JsonRpcError::method_not_found(method)),
         };
@@ -925,8 +962,8 @@ fn workspace_executor_config_to_value(config: &WorkspaceExecutorConfig) -> Value
     })
 }
 
-fn workspace_executor_metadata(config: &WorkspaceExecutorConfig) -> Value {
-    let mut executors = vec![json!({ "id": "local" })];
+fn workspace_executor_metadata(config: &WorkspaceExecutorConfig, local: Value) -> Value {
+    let mut executors = vec![local];
     executors.extend(
         config
             .executors
@@ -939,8 +976,8 @@ fn workspace_executor_metadata(config: &WorkspaceExecutorConfig) -> Value {
     })
 }
 
-fn workspace_executor_result(config: &WorkspaceExecutorConfig) -> Value {
-    let metadata = workspace_executor_metadata(config);
+fn workspace_executor_result(config: &WorkspaceExecutorConfig, local: Value) -> Value {
+    let metadata = workspace_executor_metadata(config, local);
     let text = executor_list_output_text(&json!({ "metadata": metadata.clone() }))
         .unwrap_or_else(|| "executors:\n- none".to_string());
     json!({

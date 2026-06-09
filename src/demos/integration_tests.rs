@@ -2050,6 +2050,15 @@ async fn manager_executor_config_uses_workspace_host_store() {
     .await;
     assert!(list["error"].is_null(), "initial list failed: {list:?}");
     assert_eq!(meta(&list)["metadata"]["default"], "local");
+    let local = &meta(&list)["metadata"]["executors"][0];
+    assert_eq!(local["id"], "local");
+    assert!(
+        local["url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("ws://"),
+        "local executor should expose PTY URL for refs-ptyt, got: {local:?}"
+    );
     assert_eq!(
         meta(&list)["metadata"]["executors"]
             .as_array()

@@ -245,7 +245,7 @@ fn exbash_tmp_stopped_task(id: usize) -> ExbashSyncInput {
     ExbashSyncInput {
         async_id: Some(format!("tmp-{id}")),
         executor: Some("local".to_string()),
-        state: Some(if id % 2 == 0 {
+        state: Some(if id.is_multiple_of(2) {
             "stop".to_string()
         } else {
             "exit:0".to_string()

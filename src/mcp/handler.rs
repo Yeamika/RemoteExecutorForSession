@@ -59,7 +59,6 @@ struct WorkspaceExecutorInfo {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkspaceExecutorConfig {
-    default_executor: String,
     executors: Vec<WorkspaceExecutorInfo>,
 }
 
@@ -189,29 +188,6 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         Ok(())
     }
 
-    async fn sync_workspace_executor_default(
-        &self,
-        config: &WorkspaceExecutorConfig,
-    ) -> Result<(), JsonRpcError> {
-        for item in &config.executors {
-            self.manager()?
-                .connect_to_executor(ConnectExecutorOptions {
-                    id: item.id.clone(),
-                    url: item.url.clone(),
-                    system: item.system.clone(),
-                    device: item.device.clone(),
-                    labels: item.labels.clone(),
-                })
-                .await
-                .map_err(|err| JsonRpcError::internal(err.to_string()))?;
-        }
-        self.manager()?
-            .set_default_executor(&config.default_executor)
-            .await
-            .map_err(|err| JsonRpcError::internal(err.to_string()))?;
-        Ok(())
-    }
-
     async fn call_workspace_executor_manager(
         &self,
         scope: &CallScope,
@@ -242,19 +218,6 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
                     })
                     .await
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?;
-                workspace_executor_result(&config)
-            }
-            "set_default_executor" => {
-                let mut config = self.read_workspace_executor_config(scope).await?;
-                let id = optional_string_field(&arguments, "id")
-                    .or_else(|| optional_string_field(&arguments, "targetExecutor"))
-                    .ok_or_else(|| JsonRpcError::invalid_params("executor id is required"))?;
-                if id != "local" && !config.executors.iter().any(|item| item.id == id) {
-                    return Err(JsonRpcError::internal(format!("executor not found: {id}")));
-                }
-                config.default_executor = id;
-                self.write_workspace_executor_config(scope, &config).await?;
-                self.sync_workspace_executor_default(&config).await?;
                 workspace_executor_result(&config)
             }
             _ => return Err(JsonRpcError::method_not_found(method)),
@@ -921,21 +884,13 @@ fn extract_executor(arguments: &mut Value) -> String {
 }
 
 fn workspace_executor_config_from_value(value: Value) -> WorkspaceExecutorConfig {
-    let (default, entries) = match value {
-        Value::Array(entries) => ("local".to_string(), entries),
-        Value::Object(mut object) => {
-            let default = object
-                .remove("default")
-                .and_then(|value| value.as_str().map(str::to_string))
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "local".to_string());
-            let entries = object
-                .remove("executors")
-                .and_then(|value| value.as_array().cloned())
-                .unwrap_or_default();
-            (default, entries)
-        }
-        _ => ("local".to_string(), Vec::new()),
+    let entries = match value {
+        Value::Array(entries) => entries,
+        Value::Object(mut object) => object
+            .remove("executors")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default(),
+        _ => Vec::new(),
     };
     let mut seen = HashSet::new();
     let executors = entries
@@ -948,21 +903,11 @@ fn workspace_executor_config_from_value(value: Value) -> WorkspaceExecutorConfig
                 && seen.insert(entry.id.clone())
         })
         .collect::<Vec<_>>();
-    let default_executor =
-        if default == "local" || executors.iter().any(|entry| entry.id == default) {
-            default
-        } else {
-            "local".to_string()
-        };
-    WorkspaceExecutorConfig {
-        default_executor,
-        executors,
-    }
+    WorkspaceExecutorConfig { executors }
 }
 
 fn workspace_executor_config_to_value(config: &WorkspaceExecutorConfig) -> Value {
     json!({
-        "default": config.default_executor,
         "executors": config.executors,
     })
 }
@@ -976,7 +921,7 @@ fn workspace_executor_metadata(config: &WorkspaceExecutorConfig) -> Value {
             .map(|entry| serde_json::to_value(entry).unwrap_or_else(|_| json!({}))),
     );
     json!({
-        "default": config.default_executor,
+        "default": "local",
         "executors": executors,
     })
 }
@@ -2047,10 +1992,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                if matches!(
-                    method.as_str(),
-                    "list_executor" | "connect_to_executor" | "set_default_executor"
-                ) {
+                if matches!(method.as_str(), "list_executor" | "connect_to_executor") {
                     return self
                         .call_workspace_executor_manager(&scope, &method, arguments)
                         .await;

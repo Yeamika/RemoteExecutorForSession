@@ -2085,29 +2085,26 @@ async fn manager_executor_config_uses_workspace_host_store() {
         .await
         .unwrap()
         .config;
-    assert_eq!(stored["default"], "local");
+    assert!(stored.get("default").is_none());
     assert_eq!(stored["executors"][0]["id"], "exec_cfg");
     assert_eq!(stored["executors"][0]["url"], "ws://127.0.0.1:65535");
 
-    let set = call_structured(
+    let list = call_structured(
         &ep,
         "ses_manager_config",
         "RemoteExecutorManager",
-        json!({"method":"set_default_executor","id":"exec_cfg"}),
+        json!({"method":"list_executor"}),
     )
     .await;
-    assert!(set["error"].is_null(), "set default failed: {set:?}");
-    assert_eq!(meta(&set)["metadata"]["default"], "exec_cfg");
-    let stored = host
-        .read_remote_executor_config(&dir.path().to_string_lossy())
-        .await
-        .unwrap()
-        .config;
-    assert_eq!(stored["default"], "exec_cfg");
+    assert!(
+        list["error"].is_null(),
+        "post-connect list failed: {list:?}"
+    );
+    assert_eq!(meta(&list)["metadata"]["default"], "local");
 }
 
 #[tokio::test]
-async fn manager_executor_config_normalizes_legacy_array_on_write() {
+async fn manager_executor_config_normalizes_legacy_array_on_connect() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);
     let shell_manager = ShellManager::default_shell(80, 24);
@@ -2146,21 +2143,29 @@ async fn manager_executor_config_normalizes_legacy_array_on_write() {
     assert_eq!(meta(&list)["metadata"]["default"], "local");
     assert!(text(&list).contains("legacy_exec"));
 
-    let set = call_structured(
+    let connect = call_structured(
         &ep,
         "ses_manager_legacy_config",
         "RemoteExecutorManager",
-        json!({"method":"set_default_executor","id":"legacy_exec"}),
+        json!({
+            "method":"connect_to_executor",
+            "id":"next_exec",
+            "url":"ws://127.0.0.1:65534"
+        }),
     )
     .await;
-    assert!(set["error"].is_null(), "legacy set failed: {set:?}");
+    assert!(
+        connect["error"].is_null(),
+        "legacy connect failed: {connect:?}"
+    );
     let stored = host
         .read_remote_executor_config(&dir.path().to_string_lossy())
         .await
         .unwrap()
         .config;
-    assert_eq!(stored["default"], "legacy_exec");
+    assert!(stored.get("default").is_none());
     assert_eq!(stored["executors"][0]["id"], "legacy_exec");
+    assert_eq!(stored["executors"][1]["id"], "next_exec");
 }
 
 #[tokio::test]

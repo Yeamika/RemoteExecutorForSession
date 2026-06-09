@@ -301,7 +301,7 @@ For `mode="patch"`, do not pass a direct path. First call `read` on the file, co
             prop(
                 "patchText",
                 string_prop(
-                    r#"Patch text for mode=patch. Use current 1-based line instructions, one instruction per line. Supported instructions:
+                    r#"Patch text for mode=patch. Use 1-based line instructions against the file snapshot at the start of this patchText, one instruction per line. Supported instructions:
 ```text
 ***DELETE*** start-end
 ***MOVE*** start-end,startline
@@ -311,7 +311,7 @@ literal line 2
 ***APPEND_END***
 n:new line text
 ```
-`***MOVE***` moves the inclusive range after `startline`. For MOVE and APPEND_HEAD, startline `0` inserts at the start and `-1` appends at the end. Line numbers are applied in order to the current file state after earlier instructions. Use the hashRef label from read/FileAction as fileKey."#,
+`***MOVE***` moves the inclusive range after `startline`. For MOVE and APPEND_HEAD, startline `0` inserts at the start and `-1` appends at the end. All line numbers in the same patchText refer to the original file state before this patchText is applied. Use the hashRef label from read/FileAction as fileKey."#,
                 ),
             ),
             prop(

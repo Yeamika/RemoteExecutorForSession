@@ -2526,6 +2526,73 @@ async fn file_action_patch_requires_hash_ref() {
 }
 
 #[tokio::test]
+async fn file_action_patch_text_uses_snapshot_line_numbers_and_diff() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("patch_snapshot_lines.txt");
+    std::fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_patch_snapshot_lines",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let read = call(
+        &ep,
+        "ses_patch_snapshot_lines",
+        "read",
+        json!({"fileKey": file.to_string_lossy(), "executor": "local"}),
+    )
+    .await;
+    assert!(read["error"].is_null(), "read failed: {:?}", read["error"]);
+    let file_ref = file_ref_from_text(&text(&read))
+        .unwrap_or_else(|| panic!("read did not return fileRef: {read:?}"));
+
+    let patched = call_structured(
+        &ep,
+        "ses_patch_snapshot_lines",
+        "FileAction",
+        json!({
+            "mode": "patch",
+            "fileKey": file_ref,
+            "patchText": "***DELETE*** 2-2\n3:THIRD_AFTER_DELETE\n",
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert!(
+        patched["error"].is_null(),
+        "snapshot line patch failed: {:?}",
+        patched["error"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "one\nTHIRD_AFTER_DELETE\nfour\nfive\n"
+    );
+
+    let diff = patched["result"]["structuredContent"]["metadata"]["diff"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        diff.contains("-two") && diff.contains("-three") && diff.contains("+THIRD_AFTER_DELETE"),
+        "structured diff should describe the final before/after state, got: {patched:?}"
+    );
+    assert!(
+        !diff.contains("+three"),
+        "structured diff should not reflect sequential line-number semantics, got: {diff}"
+    );
+}
+
+#[tokio::test]
 async fn rg_plaintext_includes_matches_and_code_footer() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);

@@ -311,7 +311,7 @@ literal line 2
 ***APPEND_END***
 n:new line text
 ```
-`***MOVE***` moves the inclusive range after `startline`; `***APPEND_HEAD*** 0` inserts at the start. Line numbers are applied in order to the current file state after earlier instructions. Use the hashRef label from read/FileAction as fileKey."#,
+`***MOVE***` moves the inclusive range after `startline`. For MOVE and APPEND_HEAD, startline `0` inserts at the start and `-1` appends at the end. Line numbers are applied in order to the current file state after earlier instructions. Use the hashRef label from read/FileAction as fileKey."#,
                 ),
             ),
             prop(

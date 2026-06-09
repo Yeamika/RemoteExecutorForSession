@@ -23,6 +23,12 @@ struct CallScope {
     workdir: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ExbashHostSync {
+    snapshot: Option<ExbashTaskSnapshot>,
+    warning: Option<Value>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RgMode {
     Content,
@@ -188,14 +194,17 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         tracking_scope: &str,
         requested_mode: &str,
         requested_description: Option<String>,
-    ) -> Option<ExbashTaskSnapshot> {
+    ) -> ExbashHostSync {
         if !exbash_mode_creates_task(requested_mode) {
-            return None;
+            return ExbashHostSync::default();
         }
         let async_id = result
             .pointer("/metadata/asyncID")
             .and_then(Value::as_str)
-            .map(str::to_string)?;
+            .map(str::to_string);
+        let Some(async_id) = async_id else {
+            return ExbashHostSync::default();
+        };
         let executor = result
             .pointer("/metadata/executor")
             .and_then(Value::as_str)
@@ -226,27 +235,115 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             total_output,
         };
         if tracking_scope == "remote" {
-            return None;
+            return ExbashHostSync::default();
         }
-        let snapshot = if tracking_scope == "workspace" {
-            let wd_input = ExbashSyncInput {
-                session_id: Some(scope.session_id.clone()),
-                ..input
-            };
-            self.host
-                .upsert_workdir_exbash(&scope.session_id, &scope.workdir, wd_input)
-                .await
-                .ok()
-        } else {
-            self.host
-                .upsert_session_exbash(&scope.session_id, input)
-                .await
-                .ok()
+        let mut sync = ExbashHostSync::default();
+        let snapshot = match self
+            .upsert_exbash_tracking(scope, tracking_scope, input)
+            .await
+        {
+            Ok(snapshot) => Some(snapshot),
+            Err(message) => {
+                sync.warning = Some(json!({
+                    "code": "hostTrackingWriteFailed",
+                    "message": message,
+                }));
+                None
+            }
         };
         if let Some(snapshot) = snapshot.as_ref() {
             self.spawn_local_exbash_terminal_sync(scope, tracking_scope, snapshot);
         }
-        snapshot
+        sync.snapshot = snapshot;
+        sync
+    }
+
+    async fn upsert_exbash_tracking(
+        &self,
+        scope: &CallScope,
+        tracking_scope: &str,
+        input: ExbashSyncInput,
+    ) -> Result<ExbashTaskSnapshot, String> {
+        if tracking_scope == "workspace" {
+            let wd_input = ExbashSyncInput {
+                session_id: Some(scope.session_id.clone()),
+                ..input
+            };
+            return self
+                .host
+                .upsert_workdir_exbash(&scope.session_id, &scope.workdir, wd_input)
+                .await
+                .map_err(|err| err.to_string());
+        }
+        self.host
+            .upsert_session_exbash(&scope.session_id, input)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn prune_undescribed_stopped_exbash(
+        &self,
+        scope: &CallScope,
+        tracking_scope: &str,
+        reason: &str,
+    ) -> Result<Option<Value>, JsonRpcError> {
+        let tasks = if tracking_scope == "workspace" {
+            self.host
+                .list_workdir_exbash(&scope.session_id, &scope.workdir, None)
+                .await
+                .map_err(|err| JsonRpcError::internal(err.to_string()))?
+        } else {
+            self.host
+                .list_session_exbash(&scope.session_id, None)
+                .await
+                .map_err(|err| JsonRpcError::internal(err.to_string()))?
+        };
+        let candidates = tasks
+            .into_iter()
+            .filter(exbash_cleanup_candidate)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let mut removed = Vec::new();
+        for task in candidates {
+            let did_remove = if tracking_scope == "workspace" {
+                self.host
+                    .remove_workdir_exbash(
+                        &scope.session_id,
+                        &scope.workdir,
+                        &task.async_id,
+                        &task.executor,
+                    )
+                    .await
+                    .map_err(|err| JsonRpcError::internal(err.to_string()))?
+            } else {
+                self.host
+                    .remove_session_exbash(&scope.session_id, &task.async_id, &task.executor)
+                    .await
+                    .map_err(|err| JsonRpcError::internal(err.to_string()))?
+            };
+            if did_remove {
+                removed.push(json!({
+                    "asyncID": task.async_id,
+                    "executor": task.executor,
+                    "state": task.state,
+                    "startedAt": task.started_at,
+                    "endedAt": task.ended_at,
+                    "totalOutput": task.total_output,
+                }));
+            }
+        }
+        if removed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "scope": tracking_scope,
+            "reason": "exbashStorageWriteRejected",
+            "message": reason,
+            "removedCount": removed.len(),
+            "removed": removed,
+        })))
     }
 
     async fn remove_exbash_tracking(
@@ -573,10 +670,10 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         scope: &CallScope,
         tracking_scope: &str,
         arguments: &Value,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<Option<Value>, JsonRpcError> {
         let mode = optional_string_field(arguments, "mode").unwrap_or_else(|| "shell".to_string());
         if !exbash_mode_creates_task(&mode) {
-            return Ok(());
+            return Ok(None);
         }
         let input = ExbashSyncInput {
             async_id: optional_string_field(arguments, "asyncID"),
@@ -593,22 +690,59 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             description: optional_string_field(arguments, "description"),
             total_output: None,
         };
+        self.check_exbash_create_with_cleanup(scope, tracking_scope, input)
+            .await
+    }
+
+    async fn check_exbash_create(
+        &self,
+        scope: &CallScope,
+        tracking_scope: &str,
+        input: &ExbashSyncInput,
+    ) -> Result<(), String> {
         if tracking_scope == "workspace" {
             let input = ExbashSyncInput {
                 session_id: Some(scope.session_id.clone()),
                 workdir: Some(scope.workdir.clone()),
-                ..input
+                ..input.clone()
             };
             return self
                 .host
                 .check_workdir_exbash_create(&scope.session_id, &scope.workdir, &input)
                 .await
-                .map_err(|err| JsonRpcError::invalid_params(err.to_string()));
+                .map_err(|err| err.to_string());
         }
         self.host
-            .check_session_exbash_create(&scope.session_id, &input)
+            .check_session_exbash_create(&scope.session_id, input)
             .await
-            .map_err(|err| JsonRpcError::invalid_params(err.to_string()))
+            .map_err(|err| err.to_string())
+    }
+
+    async fn check_exbash_create_with_cleanup(
+        &self,
+        scope: &CallScope,
+        tracking_scope: &str,
+        input: ExbashSyncInput,
+    ) -> Result<Option<Value>, JsonRpcError> {
+        match self
+            .check_exbash_create(scope, tracking_scope, &input)
+            .await
+        {
+            Ok(()) => Ok(None),
+            Err(message) if exbash_error_indicates_storage_rejection(&message) => {
+                let cleanup = self
+                    .prune_undescribed_stopped_exbash(scope, tracking_scope, &message)
+                    .await?;
+                let Some(cleanup) = cleanup else {
+                    return Err(JsonRpcError::invalid_params(message));
+                };
+                self.check_exbash_create(scope, tracking_scope, &input)
+                    .await
+                    .map_err(JsonRpcError::invalid_params)?;
+                Ok(Some(cleanup))
+            }
+            Err(message) => Err(JsonRpcError::invalid_params(message)),
+        }
     }
 }
 
@@ -709,6 +843,19 @@ fn exbash_error_indicates_missing_or_lost(message: &str) -> bool {
         || message.contains("timed out")
 }
 
+fn exbash_error_indicates_storage_rejection(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("task stack is full")
+        || message.contains("stack is full")
+        || message.contains("quota")
+        || message.contains("capacity")
+        || message.contains("limit")
+        || message.contains("storage")
+        || message.contains("write")
+        || message.contains("rejected")
+        || message.contains("refused")
+}
+
 fn exbash_remove_warning_code(message: &str) -> &'static str {
     let message = message.to_ascii_lowercase();
     if message.contains("closed before responding")
@@ -719,6 +866,28 @@ fn exbash_remove_warning_code(message: &str) -> &'static str {
         return "notReplayable";
     }
     "asyncTaskNotFound"
+}
+
+fn exbash_cleanup_candidate(task: &ExbashTaskSnapshot) -> bool {
+    let no_description = task
+        .description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty();
+    no_description && exbash_task_is_stopped(task)
+}
+
+fn exbash_task_is_stopped(task: &ExbashTaskSnapshot) -> bool {
+    if let Some(state) = task.state.as_deref().map(str::trim) {
+        if state == "running" || state == "unknown" || state.is_empty() {
+            return false;
+        }
+        if matches!(state, "stop" | "stopped" | "timeout") || state.starts_with("exit:") {
+            return true;
+        }
+    }
+    task.ended_at.is_some() || task.exit_code.is_some()
 }
 
 fn now_ms() -> i64 {
@@ -1455,7 +1624,8 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     .or_else(|| optional_string_field(&call_args, "targetExecutor"))
                     .unwrap_or_else(|| "local".to_string());
                 let requested_description = optional_string_field(&call_args, "description");
-                self.check_exbash_create_allowed(&scope, &tracking_scope, &call_args)
+                let pre_create_cleanup = self
+                    .check_exbash_create_allowed(&scope, &tracking_scope, &call_args)
                     .await?;
                 remove_field(&mut call_args, "scope");
                 remove_field(&mut call_args, "spoe");
@@ -1497,7 +1667,10 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     }
                 };
                 let mut value = result;
-                if let Some(snapshot) = self
+                if let Some(cleanup) = pre_create_cleanup {
+                    set_metadata_field(&mut value, "hostCleanup", cleanup);
+                }
+                let host_sync = self
                     .upsert_exbash_from_result(
                         &scope,
                         &value,
@@ -1505,8 +1678,11 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                         &mode,
                         requested_description,
                     )
-                    .await
-                {
+                    .await;
+                if let Some(warning) = host_sync.warning {
+                    set_metadata_field(&mut value, "hostWarning", warning);
+                }
+                if let Some(snapshot) = host_sync.snapshot {
                     value["metadata"]["hostSnapshot"] =
                         serde_json::to_value(snapshot).unwrap_or_default();
                 } else if let Some(async_id) =

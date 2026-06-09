@@ -241,6 +241,23 @@ fn exbash_limit_task(id: usize) -> ExbashSyncInput {
     }
 }
 
+fn exbash_tmp_stopped_task(id: usize) -> ExbashSyncInput {
+    ExbashSyncInput {
+        async_id: Some(format!("tmp-{id}")),
+        executor: Some("local".to_string()),
+        state: Some(if id % 2 == 0 {
+            "stop".to_string()
+        } else {
+            "exit:0".to_string()
+        }),
+        started_at: Some(id as i64),
+        ended_at: Some(id as i64 + 1),
+        command: Some(format!("echo tmp {id}")),
+        description: None,
+        ..ExbashSyncInput::default()
+    }
+}
+
 async fn wait_for_session_exbash_state(
     host: &MemorySessionHost,
     session_id: &str,
@@ -1217,6 +1234,54 @@ async fn exbash_session_stack_full_rejects_new_run_before_spawn() {
 }
 
 #[tokio::test]
+async fn exbash_session_stack_full_prunes_tmp_tasks_before_spawn() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(
+        MemorySessionHost::new("ses_session_cleanup", dir.path().to_string_lossy())
+            .with_exbash_task_limit(10),
+    );
+    for id in 0..10 {
+        host.upsert_session_exbash("ses_session_cleanup", exbash_tmp_stopped_task(id))
+            .await
+            .unwrap();
+    }
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let created = call_structured(
+        &ep,
+        "ses_session_cleanup",
+        "exbash",
+        json!({"mode":"run","command":"echo allowed","read_timeout":5000}),
+    )
+    .await;
+    assert!(
+        created["error"].is_null(),
+        "cleanup should allow exbash create, got: {:?}",
+        created["error"]
+    );
+    assert!(text(&created).contains("allowed"));
+    let cleanup = &meta(&created)["metadata"]["hostCleanup"];
+    assert_eq!(cleanup["scope"], "local");
+    assert_eq!(cleanup["removedCount"], 10);
+
+    let list = call(&ep, "ses_session_cleanup", "exbash", json!({"mode":"list"})).await;
+    let list_text = text(&list);
+    assert!(
+        list_text.contains("local:0 workspace:0") && !list_text.contains("tmp-"),
+        "tmp tasks should be removed after cleanup create, got: {list_text:?}"
+    );
+}
+
+#[tokio::test]
 async fn exbash_workspace_stack_full_rejects_new_run_before_spawn() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);
@@ -1261,6 +1326,65 @@ async fn exbash_workspace_stack_full_rejects_new_run_before_spawn() {
     )
     .await;
     assert!(list["error"].is_null(), "list failed: {:?}", list["error"]);
+}
+
+#[tokio::test]
+async fn exbash_workspace_stack_full_prunes_tmp_tasks_before_spawn() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(
+        MemorySessionHost::new("ses_workspace_cleanup", dir.path().to_string_lossy())
+            .with_exbash_task_limit(10),
+    );
+    let workdir = dir.path().to_string_lossy();
+    for id in 0..10 {
+        host.upsert_workdir_exbash(
+            "ses_workspace_cleanup",
+            &workdir,
+            exbash_tmp_stopped_task(id),
+        )
+        .await
+        .unwrap();
+    }
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let created = call_structured(
+        &ep,
+        "ses_workspace_cleanup",
+        "exbash",
+        json!({"mode":"run","scope":"workspace","command":"echo allowed-workspace","read_timeout":5000}),
+    )
+    .await;
+    assert!(
+        created["error"].is_null(),
+        "workspace cleanup should allow exbash create, got: {:?}",
+        created["error"]
+    );
+    assert!(text(&created).contains("allowed-workspace"));
+    let cleanup = &meta(&created)["metadata"]["hostCleanup"];
+    assert_eq!(cleanup["scope"], "workspace");
+    assert_eq!(cleanup["removedCount"], 10);
+
+    let list = call(
+        &ep,
+        "ses_workspace_cleanup",
+        "exbash",
+        json!({"mode":"list","scope":"workspace"}),
+    )
+    .await;
+    let list_text = text(&list);
+    assert!(
+        list_text.contains("local:0 workspace:0") && !list_text.contains("tmp-"),
+        "workspace tmp tasks should be removed after cleanup create, got: {list_text:?}"
+    );
 }
 
 #[tokio::test]
@@ -1578,8 +1702,8 @@ async fn exbash_cleanup_syncs_host_tracking() {
         serde_json::from_value(json!({"id":1,"tool":"list_executor","params":{}})).unwrap(),
     )
     .await;
-    let remote_url = serde_json::to_value(&remote_list.result).unwrap()["metadata"]["executors"]
-        [0]["url"]
+    let remote_url = serde_json::to_value(&remote_list.result).unwrap()["metadata"]["executors"][0]
+        ["url"]
         .as_str()
         .unwrap()
         .to_string();
@@ -2230,7 +2354,9 @@ async fn file_action_patch_requires_hash_ref() {
         "FileAction structuredContent should include diff metadata, got: {structured:?}"
     );
     assert!(
-        structured["result"]["structuredContent"].get("output").is_none(),
+        structured["result"]["structuredContent"]
+            .get("output")
+            .is_none(),
         "structuredContent should not duplicate model-visible output"
     );
 }

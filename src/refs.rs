@@ -190,4 +190,16 @@ mod tests {
         assert_eq!(small.len(), 4);
         assert_eq!(label, format!("App.ts #{}", small));
     }
+
+    #[test]
+    fn labels_hash_refs_with_filename_only() {
+        let (_file_key_ref, filename, small, label) = make_entry_parts(
+            None,
+            "file-key",
+            ".opencode/remote_executor_infos.json",
+            "sha256:abc",
+        );
+        assert_eq!(filename, "remote_executor_infos.json");
+        assert_eq!(label, format!("remote_executor_infos.json #{}", small));
+    }
 }

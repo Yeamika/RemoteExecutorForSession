@@ -2080,6 +2080,46 @@ async fn file_action_patch_requires_hash_ref() {
         std::fs::read_to_string(&file).unwrap(),
         "base\nhashRef write\n"
     );
+
+    let read = call(
+        &ep,
+        "ses_patch_hash_ref",
+        "read",
+        json!({"fileKey": file.to_string_lossy(), "executor": "local"}),
+    )
+    .await;
+    assert!(read["error"].is_null(), "read failed: {:?}", read["error"]);
+    let file_ref = file_ref_from_text(&text(&read))
+        .unwrap_or_else(|| panic!("read did not return fileRef after valid patch: {read:?}"));
+
+    let structured = call_structured(
+        &ep,
+        "ses_patch_hash_ref",
+        "FileAction",
+        json!({
+            "mode": "patch",
+            "fileKey": file_ref,
+            "patchText": "***APPEND_HEAD*** -1\nstructured diff\n***APPEND_END***\n",
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert!(
+        structured["error"].is_null(),
+        "structured hashRef patch failed: {:?}",
+        structured["error"]
+    );
+    let diff = structured["result"]["structuredContent"]["metadata"]["diff"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        diff.contains("+structured diff"),
+        "FileAction structuredContent should include diff metadata, got: {structured:?}"
+    );
+    assert!(
+        structured["result"]["structuredContent"].get("output").is_none(),
+        "structuredContent should not duplicate model-visible output"
+    );
 }
 
 #[tokio::test]

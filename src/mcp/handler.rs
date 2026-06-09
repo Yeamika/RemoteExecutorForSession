@@ -1395,10 +1395,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     Some("patch" | "rename") => strip_hash_code_lines(&raw_output_text),
                     _ => raw_output_text,
                 };
-                let structured_content = match file_action_mode.as_deref() {
-                    Some("create" | "patch" | "rename" | "delete") => None,
-                    _ => Some(strip_output(value)),
-                };
+                let structured_content = Some(strip_output(value));
                 Ok(McpCallResult {
                     content: vec![McpContentText {
                         kind: "text".to_string(),

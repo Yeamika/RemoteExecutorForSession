@@ -418,7 +418,6 @@ async fn run_session(
     let mut file_paths: Vec<Option<PathBuf>> = vec![None; plan.len()];
     let mut file_refs: Vec<Option<String>> = vec![None; plan.len()];
     let mut file_executors: Vec<Option<&'static str>> = vec![None; plan.len()];
-    let mut file_first_lines: Vec<Option<String>> = vec![None; plan.len()];
     let mut task_ids: Vec<Option<String>> = vec![None; plan.len()];
     let mut pass = 0usize;
     let mut fail = 0usize;
@@ -450,11 +449,8 @@ async fn run_session(
                     pty_skipped += 1;
                     continue;
                 };
-                let first_line = file_first_lines[*file_idx]
-                    .as_deref()
-                    .unwrap_or("fn placeholder(){}");
                 let patch_text = format!(
-                    "@@ -1,1 +1,2 @@\n {first_line}\n+// patched session={si} call={ci}\n"
+                    "***APPEND_HEAD*** 1\n// patched session={si} call={ci}\n***APPEND_END***\n"
                 );
                 call(ep, &session_id, "FileAction", json!({"mode":"patch","fileKey":key,"patchText":patch_text,"executor":file_executor})).await
             }
@@ -500,11 +496,10 @@ async fn run_session(
         }
 
         let matched = match action {
-            Action::Create { name, content } => {
+            Action::Create { name, content: _ } => {
                 if ok(&resp) {
                     file_paths[ci] = Some(dir.join(name));
                     file_executors[ci] = Some(executor);
-                    file_first_lines[ci] = content.lines().next().map(str::to_string);
                     let output = text(&resp);
                     let fref = output
                         .lines()
@@ -1969,7 +1964,7 @@ async fn file_action_patch_requires_hash_ref() {
         json!({
             "mode": "patch",
             "fileKey": file.to_string_lossy(),
-            "patchText": "@@ -1 +1,2 @@\n base\n+direct should not write\n",
+            "patchText": "***APPEND_HEAD*** 1\ndirect should not write\n***APPEND_END***\n",
             "executor": "local"
         }),
     )
@@ -2001,18 +1996,21 @@ async fn file_action_patch_requires_hash_ref() {
         json!({
             "mode": "patch",
             "fileKey": file_ref,
-            "patchText": "this is not a unified diff",
+            "patchText": "this is not a line patch",
             "executor": "local"
         }),
     )
     .await;
-    assert_eq!(invalid_patch["error"]["code"], json!(-32602));
+    assert!(
+        !invalid_patch["error"].is_null(),
+        "invalid line patch should fail: {invalid_patch:?}"
+    );
     assert!(
         invalid_patch["error"]["message"]
             .as_str()
             .unwrap_or("")
-            .contains("unified diff hunk"),
-        "invalid hashRef patch should explain hunk requirement: {invalid_patch:?}"
+            .contains("invalid patchText instruction"),
+        "invalid hashRef patch should explain line patch requirement: {invalid_patch:?}"
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "base\n");
 
@@ -2027,26 +2025,26 @@ async fn file_action_patch_requires_hash_ref() {
     let file_ref = file_ref_from_text(&text(&read))
         .unwrap_or_else(|| panic!("read did not return fileRef after invalid patch: {read:?}"));
 
-    let stale_count_patch = call(
+    let bad_line_patch = call(
         &ep,
         "ses_patch_hash_ref",
         "FileAction",
         json!({
             "mode": "patch",
             "fileKey": file_ref,
-            "patchText": "@@ -1 +1,3 @@\n base\n+next\n",
+            "patchText": "***DELETE*** 2-2\n",
             "executor": "local"
         }),
     )
     .await;
-    assert_eq!(stale_count_patch["error"]["code"], json!(-32602));
-    let stale_count_message = stale_count_patch["error"]["message"].as_str().unwrap_or("");
     assert!(
-        stale_count_message.contains("stale line counts")
-            && stale_count_message.contains("declares -1,1 +1,3")
-            && stale_count_message.contains("body contains -1,1 +1,2")
-            && stale_count_message.contains("@@ -1,1 +1,2 @@"),
-        "stale count patch should explain exact hunk mismatch: {stale_count_patch:?}"
+        !bad_line_patch["error"].is_null(),
+        "bad line patch should fail: {bad_line_patch:?}"
+    );
+    let bad_line_message = bad_line_patch["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        bad_line_message.contains("DELETE line range 2-2 is out of range"),
+        "bad line patch should explain exact line mismatch: {bad_line_patch:?}"
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "base\n");
 
@@ -2059,7 +2057,7 @@ async fn file_action_patch_requires_hash_ref() {
     .await;
     assert!(read["error"].is_null(), "read failed: {:?}", read["error"]);
     let file_ref = file_ref_from_text(&text(&read))
-        .unwrap_or_else(|| panic!("read did not return fileRef after stale patch: {read:?}"));
+        .unwrap_or_else(|| panic!("read did not return fileRef after bad line patch: {read:?}"));
 
     let patched = call(
         &ep,
@@ -2068,7 +2066,7 @@ async fn file_action_patch_requires_hash_ref() {
         json!({
             "mode": "patch",
             "fileKey": file_ref,
-            "patchText": "--- a/wrong-file.txt\n+++ b/also-wrong-file.txt\n@@ -1 +1,2 @@\n base\n+hashRef write\n",
+            "patchText": "***APPEND_HEAD*** 1\nhashRef write\n***APPEND_END***\n",
             "executor": "local"
         }),
     )

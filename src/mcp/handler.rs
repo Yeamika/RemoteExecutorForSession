@@ -648,44 +648,6 @@ fn require_patch_hash_ref(arguments: &Value) -> Result<(), JsonRpcError> {
     ))
 }
 
-fn normalize_file_action_patch_text(arguments: &mut Value) {
-    if optional_string_field(arguments, "mode").as_deref() != Some("patch") {
-        return;
-    }
-    let Some(object) = arguments.as_object_mut() else {
-        return;
-    };
-    let Some(text) = object.get("patchText").and_then(Value::as_str) else {
-        return;
-    };
-    let normalized = strip_unified_diff_file_header(text);
-    if normalized != text {
-        object.insert(
-            "patchText".to_string(),
-            Value::String(normalized.to_string()),
-        );
-    }
-}
-
-fn strip_unified_diff_file_header(text: &str) -> &str {
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        if line.trim_start().starts_with("@@") {
-            return &text[offset..];
-        }
-        offset += line.len();
-    }
-    text
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct UnifiedHunkHeader {
-    old_start: usize,
-    old_count: usize,
-    new_start: usize,
-    new_count: usize,
-}
-
 fn validate_file_action_patch_text(arguments: &Value) -> Result<(), JsonRpcError> {
     if optional_string_field(arguments, "mode").as_deref() != Some("patch") {
         return Ok(());
@@ -699,135 +661,7 @@ fn validate_file_action_patch_text(arguments: &Value) -> Result<(), JsonRpcError
     if text.trim().is_empty() {
         return Ok(());
     }
-
-    validate_unified_diff_hunks(text)
-        .map_err(|message| JsonRpcError::invalid_params(format!("invalid patchText: {message}")))
-}
-
-fn validate_unified_diff_hunks(text: &str) -> Result<(), String> {
-    let lines = text.lines().collect::<Vec<_>>();
-    let mut index = 0;
-    while index < lines.len() && lines[index].trim().is_empty() {
-        index += 1;
-    }
-    if index == lines.len() {
-        return Ok(());
-    }
-    if !lines[index].starts_with("@@") {
-        return Err(format!(
-            "expected a unified diff hunk starting with `@@`; first non-empty line {} is `{}`",
-            index + 1,
-            diagnostic_line(lines[index])
-        ));
-    }
-
-    while index < lines.len() {
-        let header_line = lines[index];
-        if header_line.trim().is_empty() {
-            index += 1;
-            continue;
-        }
-        if !header_line.starts_with("@@") {
-            return Err(format!(
-                "line {} is outside a unified diff hunk: `{}`",
-                index + 1,
-                diagnostic_line(header_line)
-            ));
-        }
-        let header = parse_unified_hunk_header(header_line).ok_or_else(|| {
-            format!(
-                "line {} has an invalid hunk header `{}`; expected `@@ -old[,count] +new[,count] @@`",
-                index + 1,
-                diagnostic_line(header_line)
-            )
-        })?;
-        let header_index = index;
-        index += 1;
-
-        let mut old_count = 0usize;
-        let mut new_count = 0usize;
-        while index < lines.len() {
-            let line = lines[index];
-            if line.starts_with("@@") {
-                break;
-            }
-            if line.starts_with(' ') {
-                old_count += 1;
-                new_count += 1;
-            } else if line.starts_with('-') {
-                old_count += 1;
-            } else if line.starts_with('+') {
-                new_count += 1;
-            } else if line.starts_with('\\') {
-                // "\ No newline at end of file" markers do not count toward hunk ranges.
-            } else {
-                return Err(format!(
-                    "line {} is not a unified diff body line: `{}`; hunk body lines must start with space, `+`, `-`, or `\\`",
-                    index + 1,
-                    diagnostic_line(line)
-                ));
-            }
-            index += 1;
-        }
-
-        if old_count != header.old_count || new_count != header.new_count {
-            return Err(format!(
-                "hunk at line {} has stale line counts: header `{}` declares -{},{} +{},{} but body contains -{},{} +{},{}. Use `@@ -{},{} +{},{} @@` or adjust the hunk body.",
-                header_index + 1,
-                diagnostic_line(header_line),
-                header.old_start,
-                header.old_count,
-                header.new_start,
-                header.new_count,
-                header.old_start,
-                old_count,
-                header.new_start,
-                new_count,
-                header.old_start,
-                old_count,
-                header.new_start,
-                new_count
-            ));
-        }
-    }
-
     Ok(())
-}
-
-fn parse_unified_hunk_header(line: &str) -> Option<UnifiedHunkHeader> {
-    let rest = line.trim_start().strip_prefix("@@")?.trim_start();
-    let mut parts = rest.split_whitespace();
-    let old = parts.next()?;
-    let new = parts.next()?;
-    let close = parts.next()?;
-    if close != "@@" {
-        return None;
-    }
-    let (old_start, old_count) = parse_unified_range(old, '-')?;
-    let (new_start, new_count) = parse_unified_range(new, '+')?;
-    Some(UnifiedHunkHeader {
-        old_start,
-        old_count,
-        new_start,
-        new_count,
-    })
-}
-
-fn parse_unified_range(value: &str, sign: char) -> Option<(usize, usize)> {
-    let value = value.strip_prefix(sign)?;
-    if value.is_empty() {
-        return None;
-    }
-    let (start, count) = value.split_once(',').unwrap_or((value, "1"));
-    Some((start.parse().ok()?, count.parse().ok()?))
-}
-
-fn diagnostic_line(line: &str) -> String {
-    let text = line.escape_debug().to_string();
-    if text.len() <= 120 {
-        return text;
-    }
-    format!("{}...", &text[..120])
 }
 
 fn enable_hash_check_mode(arguments: &mut Value) {
@@ -1525,7 +1359,6 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 };
                 if name == "FileAction" {
                     require_patch_hash_ref(&arguments)?;
-                    normalize_file_action_patch_text(&mut arguments);
                     validate_file_action_patch_text(&arguments)?;
                 }
                 // Resolve hashRef if present
@@ -2096,59 +1929,6 @@ mod tests {
             line,
             "- rex-remote running totalOutput=8 description=012345678901234567890123456789 command=abcdefghijklmnopqrstuvwxyz1234"
         );
-    }
-
-    #[test]
-    fn file_action_patch_text_discards_file_headers() {
-        let patch = "--- a/wrong.txt\n+++ b/also-wrong.txt\n@@ -1 +1,2 @@\n base\n+next\n";
-        assert_eq!(
-            strip_unified_diff_file_header(patch),
-            "@@ -1 +1,2 @@\n base\n+next\n"
-        );
-    }
-
-    #[test]
-    fn file_action_patch_text_without_hunk_is_unchanged() {
-        let patch = "--- a/wrong.txt\n+++ b/also-wrong.txt\nnot a patch";
-        assert_eq!(strip_unified_diff_file_header(patch), patch);
-    }
-
-    #[test]
-    fn unified_diff_diagnostic_accepts_valid_hunks() {
-        let patch = "@@ -1 +1,2 @@\n base\n+next\n@@ -4,2 +5,2 @@ section\n-old\n+new\n context\n";
-        assert!(validate_unified_diff_hunks(patch).is_ok());
-    }
-
-    #[test]
-    fn unified_diff_diagnostic_reports_stale_counts() {
-        let patch = "@@ -382,5 +382,16 @@\n \t\tsetup_sync_bits_for_linux();\n \t} else {\n+\t\tphys_addr_t reserve_base = (phys_addr_t)load;\n+\t\tphys_size_t reserve_size = data_size;\n+\n+\t\tif (load == RK3506_AP_LOAD_BASE) {\n+\t\t\treserve_base = RK3506_AMP_DDR_BASE;\n+\t\t\treserve_size = RK3506_AMP_DDR_SIZE;\n+\t\t\tamp_trace(0x2003, reserve_base);\n+\t\t\tamp_trace(0x2004, reserve_size);\n+\t\t}\n+\n \t\tif (!sysmem_alloc_base_by_name(desc,\n-\t\t\t\t(phys_addr_t)load, data_size)) {\n+\t\t\t\treserve_base, reserve_size)) {\n \t\t\tamp_trace(0x20e2, load);\n";
-        let error = validate_unified_diff_hunks(patch).unwrap_err();
-        assert!(error.contains("line 1"));
-        assert!(error.contains("declares -382,5 +382,16"));
-        assert!(error.contains("body contains -382,5 +382,15"));
-        assert!(error.contains("@@ -382,5 +382,15 @@"));
-    }
-
-    #[test]
-    fn unified_diff_diagnostic_reports_short_replace_hunk() {
-        let patch = "@@ -280,3 +280,3 @@\n-\tif (!sysmem_alloc_base_by_name(id,\n+\telse if (!sysmem_alloc_base_by_name(id,\n \t\t\treserve_base, reserve_size)) {\n";
-        let error = validate_unified_diff_hunks(patch).unwrap_err();
-        assert!(error.contains("declares -280,3 +280,3"));
-        assert!(error.contains("body contains -280,2 +280,2"));
-        assert!(error.contains("@@ -280,2 +280,2 @@"));
-    }
-
-    #[test]
-    fn unified_diff_diagnostic_keeps_context_lines_starting_with_at_signs() {
-        let patch = "@@ -1,2 +1,2 @@\n @@ literal context\n-old\n+new\n";
-        assert!(validate_unified_diff_hunks(patch).is_ok());
-    }
-
-    #[test]
-    fn unified_diff_diagnostic_reports_bad_body_line() {
-        let error = validate_unified_diff_hunks("@@ -1 +1 @@\nbase\n").unwrap_err();
-        assert!(error.contains("line 2"));
-        assert!(error.contains("must start with space"));
     }
 
     #[test]

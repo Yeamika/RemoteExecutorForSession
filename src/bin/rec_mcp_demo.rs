@@ -103,7 +103,7 @@ async fn main() {
                 json!({"name":"FileAction","arguments":{
                     "mode":"patch",
                     "fileKey": file_ref,
-                    "patchText":"insert -1\n+// patched\n"
+                    "patchText":"***APPEND_HEAD*** 1\n// patched\n***APPEND_END***\n"
                 }}),
             ))
             .await;

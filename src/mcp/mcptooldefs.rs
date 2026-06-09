@@ -175,8 +175,9 @@ fn tool_def(
 ///       "includeStructuredContent": true,
 ///       "mode": "patch",
 ///       "fileKey": "demo.rs #8EBE",
-///       "patchText": "insert -1
-/// +// patched
+///       "patchText": "***APPEND_HEAD*** 1
+/// // patched
+/// ***APPEND_END***
 /// ",
 ///       "executor": "local"
 ///     }
@@ -300,15 +301,17 @@ For `mode="patch"`, do not pass a direct path. First call `read` on the file, co
             prop(
                 "patchText",
                 string_prop(
-                    r#"Patch text for mode=patch. Use unified diff hunks starting with `@@`; keep context lines accurate. Example:
-```diff
-@@ -3,2 +3,2 @@
--status: pending
--message: replace this line
-+status: success
-+message: patch applied successfully
+                    r#"Patch text for mode=patch. Use current 1-based line instructions, one instruction per line. Supported instructions:
+```text
+***DELETE*** start-end
+***MOVE*** start-end,startline
+***APPEND_HEAD*** startline
+literal line 1
+literal line 2
+***APPEND_END***
+n:new line text
 ```
-Do not include `diff --git`, `--- a/...`, or `+++ b/...` file headers; fileKey chooses the target file. If those headers are present, REFS discards them and ignores their paths, even when they do not match fileKey. Use the hashRef label from read/FileAction as fileKey."#,
+`***MOVE***` moves the inclusive range after `startline`; `***APPEND_HEAD*** 0` inserts at the start. Line numbers are applied in order to the current file state after earlier instructions. Use the hashRef label from read/FileAction as fileKey."#,
                 ),
             ),
             prop(

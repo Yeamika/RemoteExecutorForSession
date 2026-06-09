@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
 
 type SharedManager = Arc<Caller>;
+const TMP_RUNNING_DESCRIPTION: &str = "Tmp Running";
 
 #[derive(Clone, Debug)]
 struct CallScope {
@@ -342,6 +343,16 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             .pointer("/metadata/command")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let description = requested_description
+            .filter(|description| !description.trim().is_empty())
+            .or_else(|| {
+                result
+                    .pointer("/metadata/description")
+                    .and_then(Value::as_str)
+                    .filter(|description| !description.trim().is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| Some(TMP_RUNNING_DESCRIPTION.to_string()));
         let state = Some(normalized_exbash_state(result, requested_mode, None));
         let exit_code = metadata_exit_code_i32(result);
         let pid = metadata_i64(result, "pid");
@@ -359,7 +370,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             started_at,
             ended_at,
             command,
-            description: requested_description,
+            description,
             total_output,
         };
         if tracking_scope == "remote" {
@@ -409,7 +420,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             .map_err(|err| err.to_string())
     }
 
-    async fn prune_undescribed_stopped_exbash(
+    async fn prune_temporary_stopped_exbash(
         &self,
         scope: &CallScope,
         tracking_scope: &str,
@@ -664,12 +675,12 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         let executor_filter = optional_string_field(arguments, "executor")
             .or_else(|| optional_string_field(arguments, "targetExecutor"));
         let display_executor = executor_filter.as_deref().unwrap_or("all");
-        let local_tasks = self
+        let mut local_tasks = self
             .host
             .list_session_exbash(&scope.session_id, executor_filter.as_deref())
             .await
             .map_err(|err| JsonRpcError::internal(err.to_string()))?;
-        let workspace_tasks = self
+        let mut workspace_tasks = self
             .host
             .list_workdir_exbash(
                 &scope.session_id,
@@ -678,6 +689,8 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             )
             .await
             .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+        sort_exbash_tasks(&mut local_tasks);
+        sort_exbash_tasks(&mut workspace_tasks);
 
         if list_scope == "remote" {
             let Some(remote_executor) = executor_filter.as_deref() else {
@@ -856,7 +869,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             Ok(()) => Ok(None),
             Err(message) if exbash_error_indicates_storage_rejection(&message) => {
                 let cleanup = self
-                    .prune_undescribed_stopped_exbash(scope, tracking_scope, &message)
+                    .prune_temporary_stopped_exbash(scope, tracking_scope, &message)
                     .await?;
                 let Some(cleanup) = cleanup else {
                     return Err(JsonRpcError::invalid_params(message));
@@ -1104,13 +1117,24 @@ fn exbash_remove_warning_code(message: &str) -> &'static str {
 }
 
 fn exbash_cleanup_candidate(task: &ExbashTaskSnapshot) -> bool {
-    let no_description = task
-        .description
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or("")
-        .is_empty();
-    no_description && exbash_task_is_stopped(task)
+    exbash_task_is_temporary(task) && exbash_task_is_stopped(task)
+}
+
+fn exbash_task_is_temporary(task: &ExbashTaskSnapshot) -> bool {
+    let description = task.description.as_deref().map(str::trim).unwrap_or("");
+    description.is_empty() || description == TMP_RUNNING_DESCRIPTION
+}
+
+fn sort_exbash_tasks(tasks: &mut [ExbashTaskSnapshot]) {
+    tasks.sort_by(|a, b| {
+        exbash_task_is_temporary(a)
+            .cmp(&exbash_task_is_temporary(b))
+            .then_with(|| {
+                a.started_at
+                    .unwrap_or_default()
+                    .cmp(&b.started_at.unwrap_or_default())
+            })
+    });
 }
 
 fn exbash_task_is_stopped(task: &ExbashTaskSnapshot) -> bool {
@@ -2343,6 +2367,49 @@ mod tests {
         assert_eq!(
             line,
             "- rex-remote running totalOutput=8 description=012345678901234567890123456789 command=abcdefghijklmnopqrstuvwxyz1234"
+        );
+    }
+
+    #[test]
+    fn exbash_task_sort_places_tmp_running_last() {
+        let mut tasks = vec![
+            ExbashTaskSnapshot {
+                async_id: "tmp".to_string(),
+                executor: "local".to_string(),
+                session_id: Some("session".to_string()),
+                workdir: None,
+                state: Some("running".to_string()),
+                pid: None,
+                exit_code: None,
+                started_at: Some(3),
+                ended_at: None,
+                command: Some("sleep 1".to_string()),
+                description: Some("Tmp Running".to_string()),
+                total_output: None,
+            },
+            ExbashTaskSnapshot {
+                async_id: "described".to_string(),
+                executor: "local".to_string(),
+                session_id: Some("session".to_string()),
+                workdir: None,
+                state: Some("stop".to_string()),
+                pid: None,
+                exit_code: None,
+                started_at: Some(1),
+                ended_at: Some(2),
+                command: Some("true".to_string()),
+                description: Some("described".to_string()),
+                total_output: None,
+            },
+        ];
+
+        sort_exbash_tasks(&mut tasks);
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.async_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["described", "tmp"]
         );
     }
 

@@ -1009,7 +1009,7 @@ pub fn rg() -> McpToolDef {
 pub fn exbash() -> McpToolDef {
     tool_def(
         "exbash",
-        "PTY-backed background terminal. Use `shell` mode first for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Remote executor tracking is lazy: stored state is updated after successful executor calls. Before creating a task, host tracking write/capacity rejection prunes same-scope undescribed stopped tasks once, then rechecks; if still rejected, the original stack-full/write error is returned. For `remove`, missing or lost executor tasks return a warning such as `asyncTaskNotFound` or `notReplayable` and still clear host tracking.",
+        "PTY-backed background terminal. Use `shell` mode first for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Remote executor tracking is lazy: stored state is updated after successful executor calls. Runs without a description are tracked as `Tmp Running`. Before creating a task, host tracking write/capacity rejection prunes same-scope stopped temporary tasks (`Tmp Running`, plus legacy empty descriptions) once, then rechecks; if still rejected, the original stack-full/write error is returned. For `remove`, missing or lost executor tasks return a warning such as `asyncTaskNotFound` or `notReplayable` and still clear host tracking.",
         vec![],
         vec![
             exec_session_prop(),
@@ -1045,7 +1045,7 @@ pub fn exbash() -> McpToolDef {
                     "auto",
                 ),
             ),
-            prop("description", string_prop("Optional display text for the run. The description is shown in run listings and detached snapshots.")),
+            prop("description", string_prop("Optional display text for the run. The description is shown in run listings and detached snapshots; omitted or blank values are tracked as `Tmp Running`.")),
             prop("timeout", integer_prop("Total lifetime timeout in milliseconds. Omit, 0, or -1 to leave the run unmanaged.")),
             prop("read_timeout", integer_prop("How long to wait before returning. If the process is still running at timeout, the tool returns a detached snapshot with `asyncID`.")),
             prop("asyncID", string_prop("Run id returned by detached `run` or `shell`; required for `attach`, `stop`, and `remove`.")),

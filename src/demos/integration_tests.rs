@@ -277,7 +277,7 @@ fn exbash_tmp_stopped_task(id: usize) -> ExbashSyncInput {
         started_at: Some(id as i64),
         ended_at: Some(id as i64 + 1),
         command: Some(format!("echo tmp {id}")),
-        description: None,
+        description: Some("Tmp Running".to_string()),
         ..ExbashSyncInput::default()
     }
 }
@@ -1595,14 +1595,14 @@ async fn exbash_local_terminal_events_sync_host_tracking() {
             .await;
     assert_eq!(exited_snapshot.exit_code, Some(7));
     assert!(exited_snapshot.ended_at.is_some());
-    assert!(exited_snapshot.description.is_none());
+    assert_eq!(exited_snapshot.description.as_deref(), Some("Tmp Running"));
 
     let list = call(&ep, "ses_exbash_events", "exbash", json!({"mode":"list"})).await;
     let list_text = text(&list);
     assert!(
-        list_text.contains("description= command=sh -lc sleep 0.05; exit 7")
+        list_text.contains("description=Tmp Running command=sh -lc sleep 0.05; exit 7")
             && !list_text.contains("description=sh -lc"),
-        "list should keep missing description empty, got: {:?}",
+        "list should use tmp description for missing description, got: {:?}",
         list_text
     );
 

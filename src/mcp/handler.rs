@@ -391,6 +391,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
     ) -> Result<serde_json::Value, JsonRpcError> {
         // Extract executor from arguments, default to "local"
         let executor = extract_executor(&mut arguments);
+        let routed_executor = executor.clone();
         // Remove ExecutorSessionID from arguments
         remove_executor_session_id(&mut arguments);
         // Remove executor from arguments (it goes into ExecutorRequest)
@@ -420,7 +421,16 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
                 response.error.unwrap_or_else(|| "unknown error".into()),
             ));
         }
-        Ok(response.result.unwrap_or(Value::Null))
+        let mut result = response.result.unwrap_or(Value::Null);
+        if let Some(object) = result.as_object_mut() {
+            let metadata = object.entry("metadata").or_insert_with(|| json!({}));
+            if let Some(metadata) = metadata.as_object_mut() {
+                metadata
+                    .entry("executor".to_string())
+                    .or_insert(Value::String(routed_executor));
+            }
+        }
+        Ok(result)
     }
 
     async fn list_exbash(
@@ -697,6 +707,18 @@ fn exbash_error_indicates_missing_or_lost(message: &str) -> bool {
         || message.contains("connection")
         || message.contains("disconnected")
         || message.contains("timed out")
+}
+
+fn exbash_remove_warning_code(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("closed before responding")
+        || message.contains("connection")
+        || message.contains("disconnected")
+        || message.contains("timed out")
+    {
+        return "notReplayable";
+    }
+    "asyncTaskNotFound"
 }
 
 fn now_ms() -> i64 {
@@ -1441,12 +1463,34 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     Ok(result) => result,
                     Err(error) => {
                         if mode == "remove"
-                            && requested_executor == "local"
                             && exbash_error_indicates_missing_or_lost(&error.message)
                         {
                             if let Some(async_id) = requested_async_id.as_deref() {
-                                self.remove_exbash_tracking(&scope, async_id, &requested_executor)
+                                let cleanup = self
+                                    .remove_exbash_tracking(&scope, async_id, &requested_executor)
                                     .await?;
+                                let code = exbash_remove_warning_code(&error.message);
+                                let output_text = format!(
+                                    "warning: {code}\nasyncID:{async_id}\nexecutor:{requested_executor}\nmessage:{}\nhostCleanup:{cleanup}",
+                                    error.message
+                                );
+                                return Ok(McpCallResult {
+                                    content: vec![McpContentText {
+                                        kind: "text".to_string(),
+                                        text: output_text,
+                                    }],
+                                    structured_content: Some(json!({
+                                        "metadata": {
+                                            "asyncID": async_id,
+                                            "executor": requested_executor,
+                                            "warning": {
+                                                "code": code,
+                                                "message": error.message,
+                                            },
+                                            "hostCleanup": cleanup,
+                                        }
+                                    })),
+                                });
                             }
                         }
                         return Err(error);

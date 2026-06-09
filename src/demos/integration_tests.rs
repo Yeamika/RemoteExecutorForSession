@@ -158,6 +158,33 @@ fn is_hash_mismatch(r: &Value) -> bool {
         .contains("hash mismatch")
 }
 
+fn assert_remove_warning(r: &Value, async_id: &str, code: &str) {
+    assert!(
+        r["error"].is_null(),
+        "stale remove should return warning success, got: {:?}",
+        r["error"]
+    );
+    let output = text(r);
+    assert!(
+        output.contains(&format!("warning: {code}"))
+            && output.contains(&format!("asyncID:{async_id}")),
+        "stale remove warning text should mention code and asyncID, got: {:?}",
+        output
+    );
+    let structured = meta(r);
+    assert_eq!(structured["metadata"]["warning"]["code"], code);
+    assert_eq!(structured["metadata"]["asyncID"], async_id);
+    assert!(
+        structured["metadata"]["hostCleanup"]["localRemoved"]
+            .as_bool()
+            .unwrap_or(false)
+            || structured["metadata"]["hostCleanup"]["workspaceRemoved"]
+                .as_bool()
+                .unwrap_or(false),
+        "stale remove should delete at least one host tracking row, got: {structured:?}"
+    );
+}
+
 fn file_ref_from_text(output: &str) -> Option<String> {
     const START: &str = "<fileRef>";
     const END: &str = "</fileRef>";
@@ -1545,6 +1572,32 @@ async fn exbash_detached_run_returns_before_event_sync() {
 #[tokio::test]
 async fn exbash_cleanup_syncs_host_tracking() {
     let caller = new_manager().await.unwrap();
+    let remote_caller = new_manager().await.unwrap();
+    let remote_list = crate::rec::manager_handle(
+        &remote_caller,
+        serde_json::from_value(json!({"id":1,"tool":"list_executor","params":{}})).unwrap(),
+    )
+    .await;
+    let remote_url = serde_json::to_value(&remote_list.result).unwrap()["metadata"]["executors"]
+        [0]["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let connect_remote = crate::rec::manager_handle(
+        &caller,
+        serde_json::from_value(json!({
+            "id": 2,
+            "tool": "connect_to_executor",
+            "params": { "id": "exec_cleanup", "url": remote_url }
+        }))
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        connect_remote.ok,
+        "connect exec_cleanup failed: {:?}",
+        connect_remote.error
+    );
     let shared_manager = Arc::new(caller);
     let shell_manager = ShellManager::default_shell(80, 24);
     let dir = tempfile::tempdir().unwrap();
@@ -1737,29 +1790,14 @@ async fn exbash_cleanup_syncs_host_tracking() {
         "source workspace tracking should remain stale before cleanup"
     );
 
-    let remove = call(
+    let remove = call_structured(
         &ep,
         "ses_exbash_cleanup",
         "exbash",
         json!({"mode":"remove","asyncID":stale_async_id}),
     )
     .await;
-    assert!(
-        !remove["error"].is_null(),
-        "stale remove should return the executor error"
-    );
-    assert!(
-        remove["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("does not exist")
-            || remove["error"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("not found"),
-        "stale remove should return notfound, got: {:?}",
-        remove["error"]
-    );
+    assert_remove_warning(&remove, &stale_async_id, "asyncTaskNotFound");
     let workspace_list = call(
         &ep,
         "ses_exbash_cleanup",
@@ -1773,6 +1811,81 @@ async fn exbash_cleanup_syncs_host_tracking() {
             && !workspace_list_text.contains(&stale_async_id),
         "stale remove should clear host tracking through MCP, got: {:?}",
         workspace_list_text
+    );
+
+    let remote = call_structured(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"run","command":"sleep 20","read_timeout":10,"executor":"exec_cleanup"}),
+    )
+    .await;
+    assert!(
+        remote["error"].is_null(),
+        "remote detached run failed: {:?}",
+        remote["error"]
+    );
+    let remote_async_id = meta(&remote)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let remote_list = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"list","executor":"exec_cleanup"}),
+    )
+    .await;
+    assert!(
+        text(&remote_list).contains(&remote_async_id),
+        "source remote tracking missing before stale cleanup"
+    );
+
+    let external_remote_remove = call(
+        &other_ep,
+        "ses_exbash_cleanup_other",
+        "exbash",
+        json!({"mode":"remove","asyncID":remote_async_id,"executor":"exec_cleanup"}),
+    )
+    .await;
+    assert!(
+        external_remote_remove["error"].is_null(),
+        "second MCP remote remove failed: {:?}",
+        external_remote_remove["error"]
+    );
+    let remote_list = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"list","executor":"exec_cleanup"}),
+    )
+    .await;
+    assert!(
+        text(&remote_list).contains(&remote_async_id),
+        "source remote tracking should remain stale before cleanup"
+    );
+
+    let remote_remove = call_structured(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"remove","asyncID":remote_async_id,"executor":"exec_cleanup"}),
+    )
+    .await;
+    assert_remove_warning(&remote_remove, &remote_async_id, "asyncTaskNotFound");
+    let remote_list = call(
+        &ep,
+        "ses_exbash_cleanup",
+        "exbash",
+        json!({"mode":"list","executor":"exec_cleanup"}),
+    )
+    .await;
+    let remote_list_text = text(&remote_list);
+    assert!(
+        remote_list_text.contains("local:0 workspace:0")
+            && !remote_list_text.contains(&remote_async_id),
+        "stale remote remove should clear host tracking through MCP, got: {:?}",
+        remote_list_text
     );
 }
 

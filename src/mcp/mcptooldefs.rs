@@ -1009,7 +1009,7 @@ pub fn rg() -> McpToolDef {
 pub fn exbash() -> McpToolDef {
     tool_def(
         "exbash",
-        "PTY-backed background terminal. Use `shell` mode first for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Remote executor tracking is lazy: stored state is updated only after a successful executor call; failed remote calls leave stored state unchanged.",
+        "PTY-backed background terminal. Use `shell` mode first for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. Remote executor tracking is lazy: stored state is updated after successful executor calls. For `remove`, missing or lost executor tasks return a warning such as `asyncTaskNotFound` or `notReplayable` and still clear host tracking.",
         vec![],
         vec![
             exec_session_prop(),

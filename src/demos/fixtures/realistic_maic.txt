@@ -1,0 +1,672 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+/*
+ * RK3506 MCU hardware debug echo firmware.
+ *
+ * - RPMSG tty echo on Linux /dev/ttyRPMSG1
+ * - UART4 echo on RM_IO20 (RX) / RM_IO26 (TX)
+ * - Toggle GPIO1_A2 every 5 seconds, and keep the echo-processing toggle
+ *
+ * Pinmux/clocks are owned by Linux DTS rockchip_amp node; the MCU only
+ * initializes UART4 registers and drives GPIO direction/level.
+ */
+
+#include "hal_bsp.h"
+#include "hal_base.h"
+
+#include "rpmsg_lite.h"
+#include "rpmsg_ns.h"
+
+#include "rpmsg_env.h"
+#include "rpmsg_platform.h"
+#define RPMSG_CHANNEL_NAME      "rpmsg-tty"
+#define RPMSG_EPT_ADDR          0x3005U
+#define MASTER_ID               0U
+#define REMOTE_ID               4U
+#define RPMSG_MEM_BASE          0x03c20000U
+
+#define RPMSG_RX_RING_SIZE      512U
+#define RPMSG_TX_CHUNK_SIZE     128U
+#define RPMSG_CMD_BUF_SIZE      16U
+#define UART4_BUF_SIZE          64U
+
+#define MCU_FW_VERSION          "rk3506-mcu-rpmsg-20260609-002"
+
+#define TIMER_FREQ_MHZ          24U
+#define MONITOR_INTERVAL_US     100000U
+#define LED_TOGGLE_INTERVAL_US  5000000U
+#define RPMSG_INITIAL_TIMEOUT_US 2000000U
+#define RPMSG_REINIT_TIMEOUT_US  500000U
+
+/* Lightweight liveness/debug monitor for Linux devmem reads. */
+#define MCU_MONITOR_TRACE_BASE  ((volatile uint32_t *)0x03c4f000U)
+#define MCU_MONITOR_MAGIC       0x56455232U  /* 'VER2' */
+
+/* Keep this firmware silent on libc printf/HAL_DBG paths. */
+#define printf(...) do { } while (0)
+
+static struct rpmsg_lite_instance *g_rpmsg_instance;
+static struct rpmsg_lite_endpoint *g_rpmsg_ept;
+
+static volatile uint8_t g_rpmsg_rx_ring[RPMSG_RX_RING_SIZE];
+static volatile uint32_t g_rpmsg_rx_head;
+static volatile uint32_t g_rpmsg_rx_tail;
+static volatile uint32_t g_rpmsg_rx_src;
+
+static uint8_t g_rpmsg_cmd_buf[RPMSG_CMD_BUF_SIZE];
+static uint32_t g_rpmsg_cmd_len;
+static volatile uint32_t g_rpmsg_version_requested;
+static volatile uint32_t g_rpmsg_ver_match;
+
+static volatile uint32_t g_rpmsg_rx_bytes;
+static volatile uint32_t g_rpmsg_tx_bytes;
+static volatile uint32_t g_rpmsg_drop_bytes;
+static volatile uint32_t g_uart4_rx_bytes;
+static volatile uint32_t g_uart4_tx_bytes;
+static volatile uint32_t g_process_count;
+static volatile uint32_t g_gpio1_a2_level;
+
+static uint64_t g_last_monitor_time;
+static uint64_t g_last_led_time;
+static uint64_t g_pending_reinit_time;
+static uint32_t g_seen_notify_count;
+static uint32_t g_pending_notify_count;
+static uint32_t g_seen_rx_bytes;
+static uint32_t g_seen_tx_bytes;
+
+static volatile uint32_t g_rpmsg_announce_count;
+static volatile uint32_t g_rpmsg_reinit_count;
+static volatile uint32_t g_rpmsg_reinit_fail_count;
+
+
+extern uint32_t rpmsg_platform_get_notify_count(void);
+extern void rpmsg_platform_reset_first_notify(void);
+extern void rpmsg_platform_remote_handle_pending(void);
+
+static void service_uart4_echo(void);
+static inline uint64_t get_time_us(void)
+{
+    return HAL_GetSysTimerCount() / TIMER_FREQ_MHZ;
+}
+
+static inline uint32_t mcu_read_msp(void)
+{
+    uint32_t v;
+
+    __asm volatile ("mrs %0, msp" : "=r" (v));
+    return v;
+}
+
+static inline uint32_t mcu_read_pc(void)
+{
+    uint32_t v;
+
+    __asm volatile ("mov %0, pc" : "=r" (v));
+    return v;
+}
+
+static inline uint32_t mcu_read_lr(void)
+{
+    uint32_t v;
+
+    __asm volatile ("mov %0, lr" : "=r" (v));
+    return v;
+}
+
+static inline uint32_t mcu_read_psp(void)
+{
+    uint32_t v;
+
+    __asm volatile ("mrs %0, psp" : "=r" (v));
+    return v;
+}
+
+static __attribute__((noinline)) void mcu_monitor_trace(uint32_t stage)
+{
+    volatile uint32_t *t = MCU_MONITOR_TRACE_BASE;
+
+    t[0] = MCU_MONITOR_MAGIC;
+    t[1] = stage;
+    t[2]++;
+    t[3] = mcu_read_msp();
+    t[4] = __get_IPSR();
+    t[5] = g_rpmsg_rx_bytes;
+    t[6] = g_rpmsg_tx_bytes;
+    t[7] = g_uart4_rx_bytes;
+    t[8] = g_uart4_tx_bytes;
+    t[9] = g_process_count;
+    t[10] = g_gpio1_a2_level;
+    t[11] = g_rpmsg_rx_src;
+    t[12] = g_rpmsg_drop_bytes;
+    t[13] = g_rpmsg_announce_count;
+    t[14] = g_rpmsg_reinit_count;
+    t[15] = g_rpmsg_reinit_fail_count;
+    t[16] = mcu_read_pc();
+    t[17] = mcu_read_lr();
+    t[18] = mcu_read_psp();
+    t[19] = __get_CONTROL();
+    t[20] = __get_xPSR();
+}
+
+static __attribute__((noreturn)) void mcu_fault_trace(uint32_t stage,
+                                                      uint32_t *stacked)
+{
+    volatile uint32_t *t = MCU_MONITOR_TRACE_BASE;
+    uint32_t lr;
+
+    __asm volatile ("mov %0, lr" : "=r" (lr));
+
+    t[0] = MCU_MONITOR_MAGIC;
+    t[1] = stage;
+    t[2]++;
+    t[3] = mcu_read_msp();
+    t[4] = __get_IPSR();
+    t[16] = mcu_read_pc();
+    t[17] = lr;
+    t[18] = mcu_read_psp();
+    t[19] = __get_CONTROL();
+    t[20] = __get_xPSR();
+    t[21] = (uint32_t)stacked;
+
+    if (stacked != NULL) {
+        t[22] = stacked[0];  /* r0 */
+        t[23] = stacked[1];  /* r1 */
+        t[24] = stacked[2];  /* r2 */
+        t[25] = stacked[3];  /* r3 */
+        t[26] = stacked[4];  /* r12 */
+        t[27] = stacked[5];  /* stacked lr */
+        t[28] = stacked[6];  /* stacked pc */
+        t[29] = stacked[7];  /* stacked xpsr */
+    }
+
+    while (1) {
+        t[2]++;
+    }
+}
+
+void mcu_hardfault_trace(uint32_t *stacked)
+{
+    mcu_fault_trace(0xdeaddeadU, stacked);
+}
+
+void HardFault_Handler(void) __attribute__((naked));
+void HardFault_Handler(void)
+{
+    __asm volatile (
+        "movs r0, #4\n"
+        "mov r1, lr\n"
+        "tst r0, r1\n"
+        "beq 1f\n"
+        "mrs r0, psp\n"
+        "b 2f\n"
+        "1:\n"
+        "mrs r0, msp\n"
+        "2:\n"
+        "b mcu_hardfault_trace\n"
+    );
+}
+
+void Default_Handler(void)
+{
+    mcu_fault_trace(0xdead0000U | (__get_IPSR() & 0xffU), NULL);
+}
+
+static void debug_gpio_init(void)
+{
+    g_gpio1_a2_level = 0;
+    HAL_GPIO_SetPinLevel(GPIO1, GPIO_PIN_A2, GPIO_LOW);
+    HAL_GPIO_SetPinDirection(GPIO1, GPIO_PIN_A2, GPIO_OUT);
+}
+
+static void debug_gpio_toggle(void)
+{
+    g_gpio1_a2_level ^= 1U;
+    HAL_GPIO_SetPinLevel(GPIO1, GPIO_PIN_A2,
+                         g_gpio1_a2_level ? GPIO_HIGH : GPIO_LOW);
+}
+
+static void mark_processed(uint32_t stage)
+{
+    g_process_count++;
+    debug_gpio_toggle();
+    mcu_monitor_trace(stage);
+}
+
+static void service_periodic_monitor(uint32_t stage)
+{
+    uint64_t now = get_time_us();
+
+    if (now - g_last_monitor_time >= MONITOR_INTERVAL_US) {
+        g_last_monitor_time = now;
+        mcu_monitor_trace(stage);
+    }
+}
+
+static void service_periodic_led(void)
+{
+    uint64_t now = get_time_us();
+
+    if (now - g_last_led_time >= LED_TOGGLE_INTERVAL_US) {
+        g_last_led_time = now;
+        debug_gpio_toggle();
+        mcu_monitor_trace(0x6300U);
+    }
+}
+
+static void rpmsg_note_rx_byte(uint8_t c)
+{
+    static const char ver_cmd[] = "ver";
+
+    if (c == (uint8_t)ver_cmd[g_rpmsg_ver_match]) {
+        g_rpmsg_ver_match++;
+        if (ver_cmd[g_rpmsg_ver_match] == '\0') {
+            g_rpmsg_ver_match = 0;
+            g_rpmsg_version_requested = 1;
+        }
+        return;
+    }
+
+    if (c == (uint8_t)ver_cmd[0]) {
+        g_rpmsg_ver_match = 1;
+    } else {
+        g_rpmsg_ver_match = 0;
+    }
+}
+
+static int32_t rpmsg_rx_callback(void *payload, uint32_t payload_len,
+                                 uint32_t src, void *priv)
+{
+    const uint8_t *p = (const uint8_t *)payload;
+
+    (void)priv;
+    g_rpmsg_rx_src = src;
+
+    for (uint32_t i = 0; i < payload_len; i++) {
+        uint32_t next = (g_rpmsg_rx_head + 1U) % RPMSG_RX_RING_SIZE;
+
+        if (next == g_rpmsg_rx_tail) {
+            g_rpmsg_drop_bytes++;
+            continue;
+        }
+
+        g_rpmsg_rx_ring[g_rpmsg_rx_head] = p[i];
+        g_rpmsg_rx_head = next;
+        g_rpmsg_rx_bytes++;
+        rpmsg_note_rx_byte(p[i]);
+        if ((p[i] == 'v') || (p[i] == 'V')) {
+            g_rpmsg_version_requested = 1;
+        }
+    }
+
+    mcu_monitor_trace(0x5000U | (payload_len & 0xffU));
+    return RL_RELEASE;
+}
+
+static uint32_t rpmsg_ring_pop_chunk(uint8_t *buf, uint32_t max_len)
+{
+    uint32_t len = 0;
+
+    while (len < max_len) {
+        uint8_t c;
+
+        __disable_irq();
+        if (g_rpmsg_rx_head == g_rpmsg_rx_tail) {
+            __enable_irq();
+            break;
+        }
+        c = g_rpmsg_rx_ring[g_rpmsg_rx_tail];
+        g_rpmsg_rx_tail = (g_rpmsg_rx_tail + 1U) % RPMSG_RX_RING_SIZE;
+        __enable_irq();
+
+        buf[len++] = c;
+    }
+
+    return len;
+}
+
+static int buffer_equals_string(const uint8_t *buf, uint32_t len,
+                                const char *s)
+{
+    uint32_t i = 0;
+
+    while (s[i] != '\0') {
+        if ((i >= len) || (buf[i] != (uint8_t)s[i])) {
+            return 0;
+        }
+        i++;
+    }
+
+    return i == len;
+}
+
+static int rpmsg_is_version_command(const uint8_t *buf, uint32_t len)
+{
+    while ((len > 0U) &&
+           ((buf[len - 1U] == '\r') || (buf[len - 1U] == '\n') ||
+            (buf[len - 1U] == '\0') || (buf[len - 1U] == ' '))) {
+        len--;
+    }
+
+    return buffer_equals_string(buf, len, "version") ||
+           buffer_equals_string(buf, len, "ver");
+}
+
+static void rpmsg_cmd_reset(void)
+{
+    g_rpmsg_cmd_len = 0;
+}
+
+static int rpmsg_note_version_command(const uint8_t *buf, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t c = buf[i];
+
+        if ((c == '\r') || (c == '\n') || (c == '\0')) {
+            int is_version = buffer_equals_string(g_rpmsg_cmd_buf,
+                                                  g_rpmsg_cmd_len,
+                                                  "version") ||
+                             buffer_equals_string(g_rpmsg_cmd_buf,
+                                                  g_rpmsg_cmd_len,
+                                                  "ver");
+
+            rpmsg_cmd_reset();
+            if (is_version) {
+                return 1;
+            }
+            continue;
+        }
+
+        if (g_rpmsg_cmd_len < sizeof(g_rpmsg_cmd_buf)) {
+            g_rpmsg_cmd_buf[g_rpmsg_cmd_len++] = c;
+            if (buffer_equals_string(g_rpmsg_cmd_buf, g_rpmsg_cmd_len,
+                                     "version") ||
+                buffer_equals_string(g_rpmsg_cmd_buf, g_rpmsg_cmd_len,
+                                     "ver")) {
+                rpmsg_cmd_reset();
+                return 1;
+            }
+        } else {
+            rpmsg_cmd_reset();
+        }
+    }
+
+    return 0;
+}
+
+static uint32_t build_version_response(uint8_t *buf, uint32_t max_len)
+{
+    static const char prefix[] = "MCU_VERSION=";
+    static const char version[] = MCU_FW_VERSION;
+    static const char suffix[] = "\r\n";
+    const char *parts[] = { prefix, version, suffix };
+    uint32_t len = 0;
+
+    for (uint32_t p = 0; p < (sizeof(parts) / sizeof(parts[0])); p++) {
+        for (uint32_t i = 0; parts[p][i] != '\0'; i++) {
+            if (len >= max_len) {
+                return len;
+            }
+            buf[len++] = (uint8_t)parts[p][i];
+        }
+    }
+
+    return len;
+}
+
+static void service_rpmsg_echo(void)
+{
+    uint8_t tx_buf[RPMSG_TX_CHUNK_SIZE];
+    uint32_t len;
+    uint32_t send_len;
+    uint32_t src;
+
+    if ((g_rpmsg_instance == NULL) || (g_rpmsg_ept == NULL)) {
+        return;
+    }
+
+    if (g_rpmsg_version_requested != 0U) {
+        __disable_irq();
+        g_rpmsg_version_requested = 0;
+        src = g_rpmsg_rx_src;
+        __enable_irq();
+
+        if (src == 0U) {
+            return;
+        }
+
+        len = build_version_response(tx_buf, sizeof(tx_buf));
+        if (rpmsg_lite_send(g_rpmsg_instance, g_rpmsg_ept, src,
+                            (char *)tx_buf, len, RL_DONT_BLOCK) == RL_SUCCESS) {
+            g_rpmsg_tx_bytes += len;
+            mark_processed(0x6150U | (len & 0xffU));
+        } else {
+            mcu_monitor_trace(0x61f0U | (len & 0xffU));
+        }
+        return;
+    }
+
+    len = rpmsg_ring_pop_chunk(tx_buf, sizeof(tx_buf));
+    if (len == 0U) {
+        return;
+    }
+
+    (void)len;
+    send_len = build_version_response(tx_buf, sizeof(tx_buf));
+
+    src = g_rpmsg_rx_src;
+    if (src == 0U) {
+        return;
+    }
+
+    if (rpmsg_lite_send(g_rpmsg_instance, g_rpmsg_ept, src,
+                        (char *)tx_buf, send_len, RL_DONT_BLOCK) == RL_SUCCESS) {
+        g_rpmsg_tx_bytes += send_len;
+        mark_processed(0x6100U | (send_len & 0xffU));
+    } else {
+        mcu_monitor_trace(0x61e0U | (send_len & 0xffU));
+    }
+}
+
+static void rpmsg_reset_runtime_state(void)
+{
+    __disable_irq();
+    g_rpmsg_rx_head = 0;
+    g_rpmsg_rx_tail = 0;
+    g_rpmsg_rx_src = 0;
+    g_rpmsg_version_requested = 0;
+    g_rpmsg_ver_match = 0;
+    g_rpmsg_cmd_len = 0;
+    __enable_irq();
+}
+
+static int rpmsg_setup(uint32_t link_id, uint32_t stage_base, uint32_t timeout_us)
+{
+    uint64_t start;
+    int32_t ret;
+
+	mcu_monitor_trace(stage_base | 0x0000U);
+    if (g_rpmsg_ept != NULL) {
+        mcu_monitor_trace(stage_base | 0x0010U);
+        rpmsg_lite_destroy_ept(g_rpmsg_instance, g_rpmsg_ept);
+        g_rpmsg_ept = NULL;
+        mcu_monitor_trace(stage_base | 0x0011U);
+    }
+
+    if (g_rpmsg_instance != NULL) {
+        mcu_monitor_trace(stage_base | 0x0020U);
+        rpmsg_lite_deinit(g_rpmsg_instance);
+        g_rpmsg_instance = NULL;
+        mcu_monitor_trace(stage_base | 0x0021U);
+    }
+
+    rpmsg_reset_runtime_state();
+    rpmsg_platform_reset_first_notify();
+
+	mcu_monitor_trace(stage_base | 0x0030U);
+    g_rpmsg_instance = rpmsg_lite_remote_init((void *)RPMSG_MEM_BASE,
+                                              link_id,
+                                              RL_NO_FLAGS);
+    if (g_rpmsg_instance == NULL) {
+        mcu_monitor_trace(stage_base | 0x00e0U);
+        return -1;
+    }
+    mcu_monitor_trace(stage_base | 0x0001U);
+
+    rpmsg_platform_reset_first_notify();
+    rpmsg_platform_remote_handle_pending();
+
+    start = get_time_us();
+    while (!rpmsg_lite_is_link_up(g_rpmsg_instance)) {
+        service_uart4_echo();
+        service_periodic_led();
+        service_periodic_monitor(stage_base | 0x00d0U);
+        if (get_time_us() - start > timeout_us) {
+            mcu_monitor_trace(stage_base | 0x00e1U);
+            return -1;
+        }
+    }
+    mcu_monitor_trace(stage_base | 0x0002U);
+
+    g_rpmsg_ept = rpmsg_lite_create_ept(g_rpmsg_instance,
+                                        RPMSG_EPT_ADDR,
+                                        rpmsg_rx_callback,
+                                        NULL);
+    if (g_rpmsg_ept == NULL) {
+        mcu_monitor_trace(stage_base | 0x00e2U);
+        return -1;
+    }
+    mcu_monitor_trace(stage_base | 0x0003U);
+
+    ret = rpmsg_ns_announce(g_rpmsg_instance, g_rpmsg_ept,
+                            RPMSG_CHANNEL_NAME, RL_NS_CREATE);
+    if (ret != RL_SUCCESS) {
+        mcu_monitor_trace(stage_base | 0x00e3U);
+        return -1;
+    }
+
+    g_rpmsg_announce_count++;
+    g_seen_notify_count = rpmsg_platform_get_notify_count();
+    g_pending_notify_count = g_seen_notify_count;
+    g_seen_rx_bytes = g_rpmsg_rx_bytes;
+    g_seen_tx_bytes = g_rpmsg_tx_bytes;
+    mcu_monitor_trace(stage_base | 0x0004U);
+
+    return 0;
+}
+
+static void service_rpmsg_reconnect(uint32_t link_id)
+{
+    uint32_t notify_count = rpmsg_platform_get_notify_count();
+    uint64_t now = get_time_us();
+
+    if (notify_count == g_seen_notify_count) {
+        return;
+    }
+
+    if ((g_rpmsg_rx_bytes != g_seen_rx_bytes) ||
+        (g_rpmsg_tx_bytes != g_seen_tx_bytes)) {
+        g_seen_notify_count = notify_count;
+        g_pending_notify_count = notify_count;
+        g_seen_rx_bytes = g_rpmsg_rx_bytes;
+        g_seen_tx_bytes = g_rpmsg_tx_bytes;
+        return;
+    }
+
+    if (notify_count != g_pending_notify_count) {
+        g_pending_notify_count = notify_count;
+        g_pending_reinit_time = now;
+        return;
+    }
+
+    if (now - g_pending_reinit_time < 1000000U) {
+        return;
+    }
+
+    mcu_monitor_trace(0x6700U);
+    if (rpmsg_setup(link_id, 0x6800U, RPMSG_REINIT_TIMEOUT_US) == 0) {
+        g_rpmsg_reinit_count++;
+        mcu_monitor_trace(0x6900U | (g_rpmsg_reinit_count & 0xffU));
+    } else {
+        g_rpmsg_reinit_fail_count++;
+        g_seen_notify_count = rpmsg_platform_get_notify_count();
+        g_pending_notify_count = g_seen_notify_count;
+        mcu_monitor_trace(0x69e0U | (g_rpmsg_reinit_fail_count & 0x1fU));
+    }
+}
+
+static void service_uart4_echo(void)
+{
+    uint8_t buf[UART4_BUF_SIZE];
+    uint32_t len = 0;
+
+    while ((len < sizeof(buf)) &&
+           (HAL_UART_GetUsr(g_uart4Dev.pReg) & UART_USR_RX_FIFO_NOT_EMPTY)) {
+        if (HAL_UART_SerialIn(g_uart4Dev.pReg, &buf[len], 1) != 1) {
+            break;
+        }
+        len++;
+    }
+
+    if (len == 0U) {
+        return;
+    }
+
+    HAL_UART_SerialOut(g_uart4Dev.pReg, buf, len);
+    g_uart4_rx_bytes += len;
+    g_uart4_tx_bytes += len;
+    mark_processed(0x6200U | (len & 0xffU));
+}
+
+static void run_uart_only_forever(uint32_t stage)
+{
+    while (1) {
+        service_uart4_echo();
+        service_periodic_led();
+        service_periodic_monitor(stage);
+    }
+}
+
+int main(void)
+{
+    struct HAL_UART_CONFIG uart4_config = {
+        .baudRate = UART_BR_1500000,
+        .dataBit = UART_DATA_8B,
+        .stopBit = UART_ONE_STOPBIT,
+        .parity = UART_PARITY_DISABLE,
+    };
+    uint32_t link_id;
+
+    mcu_monitor_trace(0x1000U);
+
+    HAL_Init();
+    BSP_Init();
+    HAL_INTMUX_Init();
+    mcu_monitor_trace(0x1100U);
+
+    debug_gpio_init();
+    mcu_monitor_trace(0x1110U);
+
+    /* Pinmux is configured by Linux DTS: UART4 RX=RM_IO20, TX=RM_IO26. */
+    HAL_UART_Init(&g_uart4Dev, &uart4_config);
+    mcu_monitor_trace(0x1200U);
+
+    link_id = RL_PLATFORM_SET_LINK_ID(MASTER_ID, REMOTE_ID);
+    if (rpmsg_setup(link_id, 0x1300U, RPMSG_INITIAL_TIMEOUT_US) != 0) {
+        g_rpmsg_reinit_fail_count++;
+        g_seen_notify_count = rpmsg_platform_get_notify_count();
+        g_pending_notify_count = g_seen_notify_count;
+        mcu_monitor_trace(0x13e0U);
+    }
+
+    while (1) {
+        service_rpmsg_reconnect(link_id);
+        service_rpmsg_echo();
+        service_uart4_echo();
+        service_periodic_led();
+        service_periodic_monitor(0x7000U);
+    }
+}
+
+int entry(void)
+{
+    return main();
+}

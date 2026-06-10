@@ -233,6 +233,15 @@ fn line_append_patch(text: &str) -> String {
     format!("***APPEND_HEAD*** -1\n{text}***APPEND_END***\n")
 }
 
+fn realistic_patch_text() -> String {
+    include_str!("fixtures/realistic_patch_request.txt")
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("patchText:"))
+        .expect("fixture should contain patchText")
+        .trim_start()
+        .replace("\\n", "\n")
+}
+
 async fn call_retry_write_busy(
     ep: &JsonRpcEndpoint<impl JsonRpcHandler>,
     session_id: &str,
@@ -2719,6 +2728,73 @@ async fn file_action_patch_text_uses_snapshot_line_numbers_and_diff() {
     assert!(
         !diff.contains("+three"),
         "structured diff should not reflect sequential line-number semantics, got: {diff}"
+    );
+}
+
+#[tokio::test]
+async fn file_action_patch_text_applies_realistic_agent_snapshot_patch() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("main.c");
+    std::fs::write(&file, include_str!("fixtures/realistic_maic.txt")).unwrap();
+
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_realistic_agent_patch",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let read = call(
+        &ep,
+        "ses_realistic_agent_patch",
+        "read",
+        json!({"fileKey": file.to_string_lossy(), "executor": "local"}),
+    )
+    .await;
+    assert!(read["error"].is_null(), "read failed: {:?}", read["error"]);
+    let file_ref = file_ref_from_text(&text(&read))
+        .unwrap_or_else(|| panic!("read did not return fileRef: {read:?}"));
+    let patch = realistic_patch_text();
+    assert!(patch.contains("***DELETE*** 491-491"), "{patch}");
+
+    let patched = call_structured(
+        &ep,
+        "ses_realistic_agent_patch",
+        "FileAction",
+        json!({
+            "mode": "patch",
+            "fileKey": file_ref,
+            "patchText": patch,
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert!(
+        patched["error"].is_null(),
+        "realistic snapshot patch should not apply line numbers sequentially: {:?}",
+        patched["error"]
+    );
+
+    let out = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(out.lines().count(), 455);
+    assert!(out.contains(" * RK3506 MCU RPMsg version firmware."));
+    assert!(out.contains("if (get_time_us() - start > timeout_us)"));
+    assert!(!out.contains("static inline uint32_t mcu_read_msp"));
+    let diff = patched["result"]["structuredContent"]["metadata"]["diff"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        diff.contains("-static inline uint32_t mcu_read_msp")
+            && diff.contains("+ * RK3506 MCU RPMsg version firmware."),
+        "structured diff should describe the realistic final before/after state, got: {patched:?}"
     );
 }
 

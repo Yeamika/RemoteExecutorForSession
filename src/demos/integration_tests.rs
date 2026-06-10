@@ -226,7 +226,7 @@ fn binary_append_patch(text: &str) -> String {
     for byte in text.as_bytes() {
         write!(&mut hex, "{byte:02X}").unwrap();
     }
-    format!("insert -1\n+{hex}")
+    format!("***APPEND***-1-{}:{hex}", text.len())
 }
 
 async fn call_retry_write_busy(
@@ -906,7 +906,10 @@ async fn stress_rpc_128x16_parallel_random_writes() {
     )
     .await;
     for r in &lists {
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            r["result"]["tools"].as_array().unwrap().len(),
+            crate::mcp::mcptooldefs::all_tools().len()
+        );
     }
 
     let unique_started = Instant::now();
@@ -1073,7 +1076,10 @@ async fn stress_rpc_64x16_parallel() {
         .collect();
     let lists = futures_util::future::join_all(lists).await;
     for r in &lists {
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            r["result"]["tools"].as_array().unwrap().len(),
+            crate::mcp::mcptooldefs::all_tools().len()
+        );
     }
 
     // === Pre-generate plans ===
@@ -2849,6 +2855,111 @@ async fn rg_files_mode_matches_paths_by_glob_pattern() {
         output
     );
     assert_eq!(meta(&response)["metadata"]["mode"], "files");
+}
+
+#[tokio::test]
+async fn skill_list_and_read_use_refs_plaintext() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let alpha = dir.path().join(".opencode/skill/alpha");
+    let zeta = dir.path().join(".opencode/skill/zeta");
+    std::fs::create_dir_all(alpha.join("reference")).unwrap();
+    std::fs::create_dir_all(&zeta).unwrap();
+    std::fs::write(
+        alpha.join("SKILL.md"),
+        r#"---
+name: alpha-skill
+description: Alpha skill for REFS tests.
+---
+# Alpha
+
+Use alpha instructions.
+"#,
+    )
+    .unwrap();
+    std::fs::write(alpha.join("reference/notes.md"), "alpha notes\n").unwrap();
+    std::fs::write(
+        zeta.join("SKILL.md"),
+        r#"---
+name: zeta-skill
+description: Zeta skill for REFS tests.
+---
+Zeta content.
+"#,
+    )
+    .unwrap();
+
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_skill",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let listed = call(
+        &ep,
+        "ses_skill",
+        "skill",
+        json!({"mode":"list","path":dir.path().to_string_lossy(),"name":"alpha|middle"}),
+    )
+    .await;
+    assert!(
+        listed["error"].is_null(),
+        "skill list failed: {:?}",
+        listed["error"]
+    );
+    let output = text(&listed);
+    assert!(output.contains("name: alpha-skill"), "got: {output:?}");
+    assert!(
+        output.contains("description: Alpha skill for REFS tests."),
+        "got: {output:?}"
+    );
+    assert!(output.contains("path:"), "got: {output:?}");
+    assert!(!output.contains("zeta-skill"), "got: {output:?}");
+    assert!(
+        !output.contains("Use alpha instructions."),
+        "got: {output:?}"
+    );
+
+    let read = call(
+        &ep,
+        "ses_skill",
+        "skill",
+        json!({"mode":"read","path":dir.path().to_string_lossy(),"name":"^alpha-skill$"}),
+    )
+    .await;
+    assert!(
+        read["error"].is_null(),
+        "skill read failed: {:?}",
+        read["error"]
+    );
+    let output = text(&read);
+    assert!(
+        output.contains(r#"<skill_content name="alpha-skill">"#),
+        "got: {output:?}"
+    );
+    assert!(output.contains("# Skill: alpha-skill"), "got: {output:?}");
+    assert!(
+        output.contains("Use alpha instructions."),
+        "got: {output:?}"
+    );
+    assert!(
+        output.contains("Base directory for this skill:"),
+        "got: {output:?}"
+    );
+    assert!(
+        output.contains("Relative paths in this skill"),
+        "got: {output:?}"
+    );
+    assert!(output.contains("<skill_files>"), "got: {output:?}");
+    assert!(output.contains("reference/notes.md"), "got: {output:?}");
 }
 
 #[tokio::test]

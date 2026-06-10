@@ -11,6 +11,7 @@ use crate::rec::{
 use crate::refs::{extract_file_ref_update, inject_file_ref, parse_hash_ref};
 use crate::types::ExbashTaskSnapshot;
 use async_trait::async_trait;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -61,6 +62,20 @@ struct WorkspaceExecutorInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkspaceExecutorConfig {
     executors: Vec<WorkspaceExecutorInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct SkillTarget {
+    executor: String,
+    path: String,
+}
+
+#[derive(Clone, Debug)]
+struct SkillInfo {
+    name: String,
+    description: String,
+    location: String,
+    content: String,
 }
 
 pub async fn create_session_mcp<H: SessionHost + 'static>(
@@ -840,6 +855,156 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         })
     }
 
+    async fn call_skill(
+        &self,
+        scope: &CallScope,
+        arguments: Value,
+    ) -> Result<McpCallResult, JsonRpcError> {
+        let mode = optional_string_field(&arguments, "mode").unwrap_or_else(|| "list".to_string());
+        let target = skill_target(&arguments)?;
+        let name = optional_string_field(&arguments, "name");
+        if mode == "read" && name.is_none() {
+            return Err(JsonRpcError::invalid_params(
+                "skill mode=read requires name regex",
+            ));
+        }
+        let pattern = Regex::new(name.as_deref().unwrap_or(".*")).map_err(|err| {
+            JsonRpcError::invalid_params(format!("invalid skill name regex: {err}"))
+        })?;
+        let mut skills = self.skill_infos(scope, &target).await?;
+        skills.retain(|skill| pattern.is_match(&skill.name));
+        skills.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.location.cmp(&b.location))
+        });
+
+        let output = if mode == "list" {
+            format_skill_list(&skills)
+        } else if mode == "read" {
+            let [skill] = skills.as_slice() else {
+                if skills.is_empty() {
+                    return Err(JsonRpcError::invalid_params("skill not found"));
+                }
+                return Err(JsonRpcError::invalid_params(format!(
+                    "skill name regex matched multiple skills: {}",
+                    skills
+                        .iter()
+                        .map(|skill| skill.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            };
+            let files = self.skill_summary_files(scope, &target, skill).await?;
+            format_skill_read(skill, &files)
+        } else {
+            return Err(JsonRpcError::invalid_params(format!(
+                "invalid skill mode: {mode}; expected list or read"
+            )));
+        };
+
+        Ok(McpCallResult {
+            content: vec![McpContentText {
+                kind: "text".to_string(),
+                text: output,
+            }],
+            structured_content: None,
+        })
+    }
+
+    async fn skill_infos(
+        &self,
+        scope: &CallScope,
+        target: &SkillTarget,
+    ) -> Result<Vec<SkillInfo>, JsonRpcError> {
+        let files = if skill_path_is_file(&target.path) {
+            vec![target.path.clone()]
+        } else {
+            let result = self
+                .call_executor_tool(
+                    scope,
+                    "glob",
+                    json!({
+                        "executor": target.executor,
+                        "path": target.path,
+                        "pattern": "**/SKILL.md",
+                        "timeout": 30_000,
+                    }),
+                )
+                .await?;
+            skill_files_from_glob(&extract_output_text(&result))
+        };
+        let mut result = Vec::new();
+        for file in files {
+            if let Some(skill) = self.skill_info(scope, target, &file).await? {
+                result.push(skill);
+            }
+        }
+        Ok(result)
+    }
+
+    async fn skill_info(
+        &self,
+        scope: &CallScope,
+        target: &SkillTarget,
+        file: &str,
+    ) -> Result<Option<SkillInfo>, JsonRpcError> {
+        let result = self
+            .call_executor_tool(
+                scope,
+                "read",
+                json!({
+                    "executor": target.executor,
+                    "filePath": file,
+                    "mode": "text",
+                    "limit": 20_000,
+                }),
+            )
+            .await?;
+        let location = result
+            .pointer("/metadata/file/canonicalPath")
+            .and_then(Value::as_str)
+            .unwrap_or(file);
+        Ok(parse_skill_info(
+            &plain_read_text(
+                result
+                    .pointer("/output/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            ),
+            location,
+        ))
+    }
+
+    async fn skill_summary_files(
+        &self,
+        scope: &CallScope,
+        target: &SkillTarget,
+        skill: &SkillInfo,
+    ) -> Result<Vec<String>, JsonRpcError> {
+        let dir = skill_dir(&skill.location);
+        if dir.is_empty() {
+            return Ok(Vec::new());
+        }
+        let result = self
+            .call_executor_tool(
+                scope,
+                "glob",
+                json!({
+                    "executor": target.executor,
+                    "path": dir,
+                    "pattern": "**/*",
+                    "timeout": 10_000,
+                }),
+            )
+            .await?;
+        Ok(skill_files_from_glob(&extract_output_text(&result))
+            .into_iter()
+            .filter(|file| !skill_path_is_file(file))
+            .take(10)
+            .collect())
+    }
+
     async fn check_exbash_create_allowed(
         &self,
         scope: &CallScope,
@@ -1062,6 +1227,155 @@ fn optional_string_field(value: &Value, field: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn skill_target(arguments: &Value) -> Result<SkillTarget, JsonRpcError> {
+    let path = optional_string_field(arguments, "path")
+        .ok_or_else(|| JsonRpcError::invalid_params("skill path is required"))?;
+    let Some((executor, rest)) = path.split_once(':') else {
+        return Ok(SkillTarget {
+            executor: "local".to_string(),
+            path,
+        });
+    };
+    let drive = executor.len() == 1 && executor.as_bytes()[0].is_ascii_alphabetic();
+    if drive || rest.is_empty() {
+        return Ok(SkillTarget {
+            executor: "local".to_string(),
+            path: format!("{executor}:{rest}"),
+        });
+    }
+    Ok(SkillTarget {
+        executor: executor.to_string(),
+        path: rest.to_string(),
+    })
+}
+
+fn skill_path_is_file(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized == "SKILL.md" || normalized.ends_with("/SKILL.md")
+}
+
+fn skill_files_from_glob(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| *line != "No files found")
+        .filter(|line| !line.starts_with("(Results are truncated"))
+        .filter(|line| !line.starts_with("matches:"))
+        .filter(|line| !line.starts_with("filesWalked:"))
+        .filter(|line| !line.starts_with("code:"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn plain_read_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            line.split_once(": ")
+                .and_then(|(prefix, rest)| {
+                    prefix.chars().all(|ch| ch.is_ascii_digit()).then_some(rest)
+                })
+                .unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_frontmatter_quotes(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let first = value.as_bytes()[0];
+        let last = value.as_bytes()[value.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return value[1..value.len() - 1].trim().to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn parse_skill_info(text: &str, location: &str) -> Option<SkillInfo> {
+    let text = text.trim_start();
+    let rest = text.strip_prefix("---")?.trim_start_matches(['\r', '\n']);
+    let (frontmatter, content) = rest.split_once("\n---")?;
+    let mut name = None;
+    let mut description = None;
+    for line in frontmatter.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "name" => name = Some(strip_frontmatter_quotes(value)),
+            "description" => description = Some(strip_frontmatter_quotes(value)),
+            _ => {}
+        }
+    }
+    let name = name?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(SkillInfo {
+        name,
+        description: description.unwrap_or_default(),
+        location: location.to_string(),
+        content: content
+            .trim_start_matches(['-', '\r', '\n'])
+            .trim()
+            .to_string(),
+    })
+}
+
+fn skill_dir(location: &str) -> String {
+    let slash = location.rfind('/');
+    let backslash = location.rfind('\\');
+    let Some(idx) = slash.into_iter().chain(backslash).max() else {
+        return ".".to_string();
+    };
+    location[..idx].to_string()
+}
+
+fn format_skill_list(skills: &[SkillInfo]) -> String {
+    if skills.is_empty() {
+        return "No skills found.".to_string();
+    }
+    skills
+        .iter()
+        .map(|skill| {
+            format!(
+                "name: {}\ndescription: {}\npath: {}",
+                skill.name, skill.description, skill.location
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn format_skill_read(skill: &SkillInfo, files: &[String]) -> String {
+    let base = skill_dir(&skill.location);
+    let list = if files.is_empty() {
+        "  <file>SKILL.md</file>".to_string()
+    } else {
+        files
+            .iter()
+            .map(|file| format!("  <file>{file}</file>"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    [
+        format!(r#"<skill_content name="{}">"#, skill.name),
+        format!("# Skill: {}", skill.name),
+        String::new(),
+        skill.content.trim().to_string(),
+        String::new(),
+        format!("Base directory for this skill: {base}"),
+        "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.".to_string(),
+        "Note: file list is sampled.".to_string(),
+        "<skill_files>".to_string(),
+        list,
+        "</skill_files>".to_string(),
+        "</skill_content>".to_string(),
+    ]
+    .join("\n")
 }
 
 fn require_patch_hash_ref(arguments: &Value) -> Result<(), JsonRpcError> {
@@ -2022,6 +2336,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     structured_content: Some(strip_output(value)),
                 })
             }
+            "skill" => self.call_skill(&scope, arguments).await,
             "rg" => {
                 let mode = extract_rg_mode(&arguments)?;
                 let method = match mode {

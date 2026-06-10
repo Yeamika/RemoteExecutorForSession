@@ -301,7 +301,7 @@ For `mode="patch"`, do not pass a direct path. First call `read` on the file, co
             prop(
                 "patchText",
                 string_prop(
-                    r#"Patch text for mode=patch. Use 1-based line instructions against the file snapshot at the start of this patchText, one instruction per line. Supported instructions:
+                    r#"Patch text for mode=patch. With patchMode=text, use 1-based line instructions against the file snapshot at the start of this patchText, one instruction per line:
 ```text
 ***DELETE*** start-end
 ***MOVE*** start-end,startline
@@ -311,7 +311,15 @@ literal line 2
 ***APPEND_END***
 n:new line text
 ```
-`***MOVE***` moves the inclusive range after `startline`. For MOVE and APPEND_HEAD, startline `0` inserts at the start and `-1` appends at the end. All line numbers in the same patchText refer to the original file state before this patchText is applied. Use the hashRef label from read/FileAction as fileKey."#,
+`***MOVE***` moves the inclusive range after `startline`. For MOVE and APPEND_HEAD, startline `0` inserts at the start and `-1` appends at the end.
+
+With patchMode=binary, use 0-based byte instructions:
+```text
+***DELETE***offset-len
+***APPEND***offset-len:HEX
+offset-len:HEX
+```
+`len` is a byte count and must match decoded HEX bytes for APPEND/replace. `***DELETE***offset-len` deletes `len` bytes at `offset`; `***APPEND***offset-len:HEX` inserts `len` bytes at byte offset `offset` (`-1` appends at EOF); `offset-len:HEX` replaces `len` bytes at `offset`. Binary patch results include a unified diff over hexdump text in structured metadata for diff UIs. All line numbers or byte offsets in the same patchText refer to the original file state before this patchText is applied. Use the hashRef label from read/FileAction as fileKey."#,
                 ),
             ),
             prop(
@@ -603,6 +611,33 @@ pub fn rg() -> McpToolDef {
             prop(
                 "timeout",
                 integer_prop("Soft search timeout in milliseconds. Default 10000. Use -1 for no timeout. When the deadline is reached, collected results are returned."),
+            ),
+        ],
+    )
+}
+
+pub fn skill() -> McpToolDef {
+    tool_def(
+        "skill",
+        "Discover or read SKILL.md instruction bundles through REFS. `path` is a skill root folder or a SKILL.md file, optionally prefixed as `executor:/path`; no prefix uses the local executor. `name` is a regex filter over skill names. Plain text output includes skill descriptions for list mode and full skill content for read mode.",
+        vec!["mode", "path"],
+        vec![
+            exec_session_prop(),
+            prop(
+                "mode",
+                string_enum_default_desc(
+                    "list returns matching skills; read returns one matching skill's full instructions.",
+                    &["list", "read"],
+                    "list",
+                ),
+            ),
+            prop(
+                "name",
+                string_prop("Regex filter over skill names. Required for read; optional for list."),
+            ),
+            prop(
+                "path",
+                string_prop("Skill root folder or SKILL.md file. Use `executor:/path` for a remote executor, or an unprefixed path for local."),
             ),
         ],
     )
@@ -1380,6 +1415,7 @@ pub fn all_tools() -> Vec<McpToolDef> {
         file_action(),
         read(),
         rg(),
+        skill(),
         exbash(),
         remote_executor_manager(),
     ]

@@ -18,6 +18,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 pty_t_protocol = { git = "https://github.com/Yeamika/RemoteExecutor.git", branch = "main" }
 rand = "0.9"
+regex = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.29"
 tempfile = "3"

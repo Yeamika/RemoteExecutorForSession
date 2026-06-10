@@ -2347,6 +2347,48 @@ async fn manager_request_reload_rebuilds_workspace_settings_and_reports_plaintex
 }
 
 #[tokio::test]
+async fn read_hash_ref_miss_falls_back_to_direct_path() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("read_hash_ref_miss.txt");
+    std::fs::write(&file, "fallback content\n").unwrap();
+
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_read_hash_ref_miss",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let read = call(
+        &ep,
+        "ses_read_hash_ref_miss",
+        "read",
+        json!({
+            "fileKey": format!("{} #25B2", file.to_string_lossy()),
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert!(
+        read["error"].is_null(),
+        "read should fall back to direct path when hashRef lookup misses: {:?}",
+        read["error"]
+    );
+    assert!(
+        text(&read).contains("fallback content"),
+        "fallback read should return file content: {read:?}"
+    );
+}
+
+#[tokio::test]
 async fn file_action_patch_requires_hash_ref() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);

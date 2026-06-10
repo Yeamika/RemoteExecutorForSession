@@ -289,6 +289,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         &self,
         scope: &CallScope,
         mut arguments: Value,
+        allow_hash_ref_fallback: bool,
     ) -> Result<(Value, Option<String>), JsonRpcError> {
         let Some(object) = arguments.as_object_mut() else {
             return Ok((arguments, None));
@@ -300,11 +301,22 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             return Ok((arguments, None));
         };
         if self.host.is_hash_ref(&file_key) {
-            let entry = self
+            let resolved = self
                 .host
                 .resolve_hash_ref(&scope.session_id, &file_key)
-                .await
-                .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+                .await;
+            let entry = match resolved {
+                Ok(entry) => entry,
+                Err(_) if allow_hash_ref_fallback => {
+                    let mut args = arguments.as_object().cloned().unwrap_or_default();
+                    let target = parse_hash_ref(&file_key)
+                        .map(|item| item.filename)
+                        .unwrap_or(file_key);
+                    args.insert("filePath".to_string(), Value::String(target));
+                    return Ok((Value::Object(args), None));
+                }
+                Err(err) => return Err(JsonRpcError::internal(err.to_string())),
+            };
             let injection = inject_file_ref(&arguments, Some(&entry));
             return Ok((injection.args, Some(entry.file_key_ref)));
         }
@@ -2173,7 +2185,9 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     validate_file_action_patch_text(&arguments)?;
                 }
                 // Resolve hashRef if present
-                let (mut args, file_key_ref) = self.resolve_file_args(&scope, arguments).await?;
+                let (mut args, file_key_ref) = self
+                    .resolve_file_args(&scope, arguments, name == "read")
+                    .await?;
                 if name == "read" {
                     enable_hash_check_mode(&mut args);
                 }

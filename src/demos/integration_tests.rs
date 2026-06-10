@@ -1575,6 +1575,68 @@ async fn exbash_plaintext_exitcode_defaults_and_list_scope() {
 }
 
 #[tokio::test]
+async fn exbash_attach_accepts_timeout_without_read_timeout() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_exbash_attach_timeout",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let detached = call_structured(
+        &ep,
+        "ses_exbash_attach_timeout",
+        "exbash",
+        json!({"mode":"run","command":"sh -lc 'sleep 0.05; echo legacy-timeout; sleep 5'","read_timeout":0}),
+    )
+    .await;
+    assert!(
+        detached["error"].is_null(),
+        "detached run failed: {:?}",
+        detached["error"]
+    );
+    let async_id = meta(&detached)["metadata"]["asyncID"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let attached = call_structured(
+        &ep,
+        "ses_exbash_attach_timeout",
+        "exbash",
+        json!({"mode":"attach","asyncID":async_id.clone(),"timeout":200}),
+    )
+    .await;
+    assert!(
+        attached["error"].is_null(),
+        "attach with legacy timeout failed: {:?}",
+        attached["error"]
+    );
+    assert!(
+        text(&attached).contains("legacy-timeout"),
+        "attach should wait using timeout fallback, got: {:?}",
+        text(&attached)
+    );
+
+    let _ = call(
+        &ep,
+        "ses_exbash_attach_timeout",
+        "exbash",
+        json!({"mode":"remove","asyncID":async_id}),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn exbash_local_terminal_events_sync_host_tracking() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);

@@ -2459,6 +2459,56 @@ async fn file_action_patch_requires_hash_ref() {
         "direct binary patch should include hexdump diff: {direct_binary:?}"
     );
 
+    let created_diff_file = dir.path().join("created_diff.txt");
+    let created_diff = call_structured(
+        &ep,
+        "ses_patch_hash_ref",
+        "FileAction",
+        json!({
+            "mode": "create",
+            "fileKey": created_diff_file.to_string_lossy(),
+            "content": "created diff\n",
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert!(
+        created_diff["error"].is_null(),
+        "create with diff failed: {:?}",
+        created_diff["error"]
+    );
+    let diff = created_diff["result"]["structuredContent"]["metadata"]["diff"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        diff.contains("+created diff"),
+        "FileAction/create should include diff metadata, got: {created_diff:?}"
+    );
+
+    let deleted_diff = call_structured(
+        &ep,
+        "ses_patch_hash_ref",
+        "FileAction",
+        json!({
+            "mode": "delete",
+            "fileKey": created_diff_file.to_string_lossy(),
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert!(
+        deleted_diff["error"].is_null(),
+        "delete with diff failed: {:?}",
+        deleted_diff["error"]
+    );
+    let diff = deleted_diff["result"]["structuredContent"]["metadata"]["diff"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        diff.contains("-created diff"),
+        "FileAction/delete should include diff metadata, got: {deleted_diff:?}"
+    );
+
     let read = call(
         &ep,
         "ses_patch_hash_ref",

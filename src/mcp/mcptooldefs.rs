@@ -281,7 +281,9 @@ pub fn file_action() -> McpToolDef {
         "FileAction",
         r#"REC file action: patch, create, delete, or rename a file.
 
-For `mode="patch"`, do not pass a direct path. First call `read` on the file, copy the exact label inside `<fileRef>...</fileRef>` such as `App.ts #A1B2`, then pass that label as `fileKey`. The hashRef resolves the file and applies stale-file hash checking before mutation."#,
+For `mode="patch"` with text patches, do not pass a direct path. First call `read` on the file, copy the exact label inside `<fileRef>...</fileRef>` such as `App.ts #A1B2`, then pass that label as `fileKey`. The hashRef resolves the file and applies stale-file hash checking before mutation.
+
+For `mode="patch"` with `patchMode="binary"`, pass a direct path or REC file key as `fileKey`; binary patch does not require hashRef and does not perform stale-file hash checking."#,
         vec!["mode"],
         vec![
             exec_session_prop(),
@@ -292,7 +294,7 @@ For `mode="patch"`, do not pass a direct path. First call `read` on the file, co
             ),
             prop(
                 "fileKey",
-                string_prop("mode=patch: required hashRef label such as `App.ts #A1B2` from `<fileRef>...</fileRef>`; direct paths are rejected for patch. Other modes may use a direct path, REC file key, or hashRef label."),
+                string_prop("mode=patch + patchMode=text: required hashRef label such as `App.ts #A1B2` from `<fileRef>...</fileRef>`. mode=patch + patchMode=binary: direct path or REC file key; hashRef is not required and hash checking is not applied. Other modes may use a direct path, REC file key, or hashRef label."),
             ),
             prop(
                 "newFilePath",
@@ -319,7 +321,7 @@ With patchMode=binary, use 0-based byte instructions:
 ***APPEND***offset-len:HEX
 offset-len:HEX
 ```
-`len` is a byte count and must match decoded HEX bytes for APPEND/replace. `***DELETE***offset-len` deletes `len` bytes at `offset`; `***APPEND***offset-len:HEX` inserts `len` bytes at byte offset `offset` (`-1` appends at EOF); `offset-len:HEX` replaces `len` bytes at `offset`. Binary patch results include a unified diff over hexdump text in structured metadata for diff UIs. All line numbers or byte offsets in the same patchText refer to the original file state before this patchText is applied. Use the hashRef label from read/FileAction as fileKey."#,
+`len` is a byte count and must match decoded HEX bytes for APPEND/replace. `***DELETE***offset-len` deletes `len` bytes at `offset`; `***APPEND***offset-len:HEX` inserts `len` bytes at byte offset `offset` (`-1` appends at EOF); `offset-len:HEX` replaces `len` bytes at `offset`. Binary patch results include a unified diff over hexdump text in structured metadata for diff UIs. All line numbers or byte offsets in the same patchText refer to the original file state before this patchText is applied. Binary patch should use a direct fileKey/path and does not perform hash checking."#,
                 ),
             ),
             prop(

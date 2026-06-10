@@ -1382,6 +1382,9 @@ fn require_patch_hash_ref(arguments: &Value) -> Result<(), JsonRpcError> {
     if optional_string_field(arguments, "mode").as_deref() != Some("patch") {
         return Ok(());
     }
+    if optional_string_field(arguments, "patchMode").as_deref() == Some("binary") {
+        return Ok(());
+    }
     let file_key = optional_string_field(arguments, "fileKey").unwrap_or_default();
     if parse_hash_ref(&file_key).is_some() {
         return Ok(());
@@ -1412,6 +1415,13 @@ fn enable_hash_check_mode(arguments: &mut Value) {
         object
             .entry("hashCheckMode".to_string())
             .or_insert(Value::Bool(true));
+    }
+}
+
+fn disable_hash_check_mode(arguments: &mut Value) {
+    if let Some(object) = arguments.as_object_mut() {
+        object.remove("hashCheckMode");
+        object.remove("hashCode");
     }
 }
 
@@ -2166,6 +2176,12 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 let (mut args, file_key_ref) = self.resolve_file_args(&scope, arguments).await?;
                 if name == "read" {
                     enable_hash_check_mode(&mut args);
+                }
+                if name == "FileAction"
+                    && file_action_mode.as_deref() == Some("patch")
+                    && optional_string_field(&args, "patchMode").as_deref() == Some("binary")
+                {
+                    disable_hash_check_mode(&mut args);
                 }
                 let executor = extract_executor_from_value(&args);
                 // Dispatch through the executor manager.

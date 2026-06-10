@@ -229,6 +229,10 @@ fn binary_append_patch(text: &str) -> String {
     format!("***APPEND***-1-{}:{hex}", text.len())
 }
 
+fn line_append_patch(text: &str) -> String {
+    format!("***APPEND_HEAD*** -1\n{text}***APPEND_END***\n")
+}
+
 async fn call_retry_write_busy(
     ep: &JsonRpcEndpoint<impl JsonRpcHandler>,
     session_id: &str,
@@ -842,8 +846,7 @@ async fn run_matrix_conflict_session(
             json!({
                 "mode": "patch",
                 "fileKey": file_ref,
-                "patchMode": "binary",
-                "patchText": binary_append_patch(&marker),
+                "patchText": line_append_patch(&marker),
                 "executor": "local"
             }),
             0x3000 + si * 193 + attempt_idx,
@@ -2384,6 +2387,35 @@ async fn file_action_patch_requires_hash_ref() {
         "direct patch should explain hashRef requirement: {rejected:?}"
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "base\n");
+
+    let binary = dir.path().join("patch_direct_binary.bin");
+    std::fs::write(&binary, b"AB").unwrap();
+    let direct_binary = call_structured(
+        &ep,
+        "ses_patch_hash_ref",
+        "FileAction",
+        json!({
+            "mode": "patch",
+            "fileKey": binary.to_string_lossy(),
+            "patchMode": "binary",
+            "patchText": "***APPEND***-1-1:43",
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert!(
+        direct_binary["error"].is_null(),
+        "direct binary patch should not require hashRef: {:?}",
+        direct_binary["error"]
+    );
+    assert_eq!(std::fs::read(&binary).unwrap(), b"ABC");
+    let binary_diff = direct_binary["result"]["structuredContent"]["metadata"]["diff"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        binary_diff.contains("+00000000: 41 42 43"),
+        "direct binary patch should include hexdump diff: {direct_binary:?}"
+    );
 
     let read = call(
         &ep,

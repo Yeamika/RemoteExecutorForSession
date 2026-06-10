@@ -1,6 +1,6 @@
 [package]
 name = "remote_executor_for_session"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "Session-aware Rust SDK wrapper around the RemoteExecutor library API"
 publish = false

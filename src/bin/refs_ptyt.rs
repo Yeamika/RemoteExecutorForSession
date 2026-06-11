@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 type ClientWsSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
@@ -1016,23 +1017,23 @@ fn draw_status_with_marker(
         SetAttribute(Attribute::Reverse),
         terminal::Clear(ClearType::CurrentLine)
     )?;
-    let width = cols as usize;
-    let marker_len = marker.chars().count();
-    let max_left = width.saturating_sub(marker_len + 1);
-    let left = trim_to_width(left, max_left);
-    let left_len = left.chars().count();
-    if left_len + 1 + marker_len <= width {
-        write!(
-            out,
-            "{left}{:>pad$}",
-            marker,
-            pad = width.saturating_sub(left_len)
-        )?;
-    } else {
-        write!(out, "{}", trim_to_width(marker, width))?;
-    }
+    write!(out, "{}", status_line(left, marker, cols as usize))?;
     queue!(out, SetAttribute(Attribute::Reset))?;
     Ok(())
+}
+
+fn status_line(left: &str, marker: &str, width: usize) -> String {
+    let marker_len = UnicodeWidthStr::width(marker);
+    let max_left = width.saturating_sub(marker_len + 1);
+    let left = trim_to_width(left, max_left);
+    let left_len = UnicodeWidthStr::width(left.as_str());
+    if left_len + 1 + marker_len <= width {
+        return format!(
+            "{left}{}{marker}",
+            " ".repeat(width.saturating_sub(left_len + marker_len))
+        );
+    }
+    trim_to_width(marker, width)
 }
 
 fn draw_error_message(out: &mut Stdout, message: &str) -> Result<()> {
@@ -1279,7 +1280,17 @@ fn previous_command(command: CommandTarget) -> CommandTarget {
 }
 
 fn trim_to_width(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+    let mut used = 0usize;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > width {
+            break;
+        }
+        used += ch_width;
+        out.push(ch);
+    }
+    out
 }
 
 fn single_line(text: &str) -> String {
@@ -1320,4 +1331,27 @@ fn default_scope() -> String {
 
 fn default_executor() -> String {
     "local".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_line_keeps_marker_on_same_row_with_wide_symbols() {
+        let line = status_line(
+            "[>] [◆:client-123]  [▶] local:rex-1781162394566-96  long title",
+            "[#]",
+            48,
+        );
+        assert_eq!(UnicodeWidthStr::width(line.as_str()), 48);
+        assert!(line.ends_with("[#]"));
+    }
+
+    #[test]
+    fn trim_to_width_uses_display_columns() {
+        let text = trim_to_width("[▶] abc", 4);
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 4);
+        assert_eq!(text, "[▶] ");
+    }
 }

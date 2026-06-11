@@ -903,7 +903,8 @@ fn draw_list_status(
     rows: u16,
 ) -> Result<()> {
     let left = format!("local {local}; workspace {workspace}  | enter attach  r refresh  q quit");
-    draw_status_with_marker(out, rows.saturating_sub(1), cols, &left, "[#]")
+    let marker = size_marker(cols, rows);
+    draw_status_with_marker(out, rows.saturating_sub(1), cols, &left, &marker)
 }
 
 fn render_attach(
@@ -938,7 +939,7 @@ fn render_attach(
             view.local_rows.saturating_sub(1),
             view.local_cols,
             message,
-            "[#]",
+            &size_marker(view.local_cols, view.local_rows),
         )?;
     } else {
         draw_attach_status(out, view, task, metrics)?;
@@ -1000,7 +1001,7 @@ fn draw_attach_status(
         view.local_rows.saturating_sub(1),
         view.local_cols,
         &body,
-        "[#]",
+        &size_marker(view.local_cols, view.local_rows),
     )
 }
 
@@ -1036,14 +1037,19 @@ fn status_line(left: &str, marker: &str, width: usize) -> String {
     trim_to_width(marker, width)
 }
 
+fn size_marker(cols: u16, rows: u16) -> String {
+    format!("[{cols}x{rows}]")
+}
+
 fn draw_error_message(out: &mut Stdout, message: &str) -> Result<()> {
     let (cols, rows) = terminal::size()?;
+    let marker = size_marker(cols, rows);
     draw_status_with_marker(
         out,
         rows.saturating_sub(1),
         cols,
         &format!("error: {message}"),
-        "[#]",
+        &marker,
     )?;
     out.flush()?;
     Ok(())

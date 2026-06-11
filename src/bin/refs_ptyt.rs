@@ -74,8 +74,6 @@ enum CommandTarget {
     Input,
     Identity,
     List,
-    Stop,
-    Remove,
     Quit,
 }
 
@@ -229,7 +227,7 @@ async fn main() -> Result<()> {
                     draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
                     match resolve_attach_target(&client, task).await {
                         Ok(target) => {
-                            let action = run_attach(&client, target, &mut rx, size).await;
+                            let action = run_attach(target, &mut rx, size).await;
                             match action {
                                 AttachAction::Quit => break,
                                 AttachAction::List => {
@@ -325,12 +323,11 @@ enum AttachAction {
 }
 
 async fn run_attach(
-    client: &RefsMcpClient,
     target: AttachTarget,
     rx: &mut mpsc::UnboundedReceiver<LocalEvent>,
     size: TerminalSize,
 ) -> AttachAction {
-    match run_attach_inner(client, target, rx, size).await {
+    match run_attach_inner(target, rx, size).await {
         Ok(action) => action,
         Err(err) => {
             let mut out = stdout();
@@ -342,7 +339,6 @@ async fn run_attach(
 }
 
 async fn run_attach_inner(
-    client: &RefsMcpClient,
     target: AttachTarget,
     rx: &mut mpsc::UnboundedReceiver<LocalEvent>,
     size: TerminalSize,
@@ -415,7 +411,6 @@ async fn run_attach_inner(
                     }
                     LocalEvent::Key(key) => {
                         match process_attach_key(
-                            client,
                             key,
                             AttachKeyContext {
                                 parser: &parser,
@@ -506,7 +501,6 @@ struct AttachKeyContext<'a> {
 }
 
 async fn process_attach_key(
-    client: &RefsMcpClient,
     key: KeyEvent,
     context: AttachKeyContext<'_>,
 ) -> Result<AttachActionRequest> {
@@ -582,22 +576,6 @@ async fn process_attach_key(
                         view.mode = Mode::Input;
                     }
                     CommandTarget::List => return Ok(AttachActionRequest::List),
-                    CommandTarget::Stop => {
-                        view.message = Some("stopping".to_string());
-                        render_attach(out, parser, view, task, metrics)?;
-                        match client.exbash_control("stop", task).await {
-                            Ok(_) => view.message = Some("stopped".to_string()),
-                            Err(err) => view.message = Some(err.to_string()),
-                        }
-                    }
-                    CommandTarget::Remove => {
-                        view.message = Some("removing".to_string());
-                        render_attach(out, parser, view, task, metrics)?;
-                        match client.exbash_control("remove", task).await {
-                            Ok(_) => return Ok(AttachActionRequest::List),
-                            Err(err) => view.message = Some(err.to_string()),
-                        }
-                    }
                     CommandTarget::Quit => return Ok(AttachActionRequest::Quit),
                 },
                 KeyCode::Left => view.command_target = previous_command(view.command_target),
@@ -626,19 +604,6 @@ impl RefsMcpClient {
             json!({
                 "mode": "list",
                 "scope": scope
-            }),
-        )
-        .await
-    }
-
-    async fn exbash_control(&self, mode: &str, task: &ExbashTask) -> Result<Value> {
-        self.call_tool(
-            "exbash",
-            json!({
-                "mode": mode,
-                "asyncID": task.async_id,
-                "executor": task.executor,
-                "scope": task.scope
             }),
         )
         .await
@@ -878,8 +843,7 @@ fn draw_list(
         }
     }
     if list.tasks.is_empty() && body_rows > 0 {
-        queue!(out, cursor::MoveTo(0, 0))?;
-        write!(out, "No exbash tasks")?;
+        draw_empty_list(out, cols, body_rows as u16)?;
     }
     if let Some(message) = message {
         let y = rows.saturating_sub(2);
@@ -892,6 +856,35 @@ fn draw_list(
     }
     draw_list_status(out, list.local_count, list.workspace_count, cols, rows)?;
     out.flush()?;
+    Ok(())
+}
+
+const EMPTY_LOGO: [&str; 5] = [
+    " ____  _____ _____ ____  ",
+    "|  _ \\| ____|  ___/ ___| ",
+    "| |_) |  _| | |_  \\___ \\ ",
+    "|  _ <| |___|  _|  ___) |",
+    "|_| \\_\\_____|_|   |____/ ",
+];
+
+fn draw_empty_list(out: &mut Stdout, cols: u16, body_rows: u16) -> Result<()> {
+    let lines = EMPTY_LOGO
+        .into_iter()
+        .chain(["", "No exbash tasks"])
+        .collect::<Vec<_>>();
+    let start = body_rows.saturating_sub(lines.len() as u16) / 2;
+    for (index, line) in lines.into_iter().enumerate() {
+        let row = start + index as u16;
+        if row >= body_rows {
+            break;
+        }
+        queue!(
+            out,
+            cursor::MoveTo(0, row),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+        write!(out, "{}", center_line(line, cols as usize))?;
+    }
     Ok(())
 }
 
@@ -1162,10 +1155,7 @@ fn task_title(task: &ExbashTask) -> String {
 }
 
 fn task_subtitle(task: &ExbashTask) -> String {
-    let command = single_line(&task.command)
-        .chars()
-        .take(30)
-        .collect::<String>();
+    let command = clipped_command_summary(&task.command);
     format!(
         "{} · {} [{}/{}] command={}",
         task.async_id, task.cwd, task.scope, task.executor, command
@@ -1246,8 +1236,6 @@ fn command_targets_text(selected: CommandTarget) -> String {
         (CommandTarget::Input, "INPUT"),
         (CommandTarget::Identity, "IDENTITY"),
         (CommandTarget::List, "LIST"),
-        (CommandTarget::Stop, "STOP"),
-        (CommandTarget::Remove, "REMOVE"),
         (CommandTarget::Quit, "QUIT"),
     ];
     items
@@ -1267,9 +1255,7 @@ fn next_command(command: CommandTarget) -> CommandTarget {
     match command {
         CommandTarget::Input => CommandTarget::Identity,
         CommandTarget::Identity => CommandTarget::List,
-        CommandTarget::List => CommandTarget::Stop,
-        CommandTarget::Stop => CommandTarget::Remove,
-        CommandTarget::Remove => CommandTarget::Quit,
+        CommandTarget::List => CommandTarget::Quit,
         CommandTarget::Quit => CommandTarget::Input,
     }
 }
@@ -1279,9 +1265,7 @@ fn previous_command(command: CommandTarget) -> CommandTarget {
         CommandTarget::Input => CommandTarget::Quit,
         CommandTarget::Identity => CommandTarget::Input,
         CommandTarget::List => CommandTarget::Identity,
-        CommandTarget::Stop => CommandTarget::List,
-        CommandTarget::Remove => CommandTarget::Stop,
-        CommandTarget::Quit => CommandTarget::Remove,
+        CommandTarget::Quit => CommandTarget::List,
     }
 }
 
@@ -1297,6 +1281,20 @@ fn trim_to_width(text: &str, width: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn center_line(line: &str, width: usize) -> String {
+    let line = trim_to_width(line, width);
+    let line_width = UnicodeWidthStr::width(line.as_str());
+    if line_width >= width {
+        return line;
+    }
+    format!("{}{}", " ".repeat((width - line_width) / 2), line)
+}
+
+fn clipped_command_summary(command: &str) -> String {
+    let first_line = command.split(['\r', '\n']).next().unwrap_or("");
+    first_line.chars().take(100).collect()
 }
 
 fn single_line(text: &str) -> String {
@@ -1359,5 +1357,22 @@ mod tests {
         let text = trim_to_width("[▶] abc", 4);
         assert_eq!(UnicodeWidthStr::width(text.as_str()), 4);
         assert_eq!(text, "[▶] ");
+    }
+
+    #[test]
+    fn command_menu_excludes_task_controls() {
+        let text = command_targets_text(CommandTarget::Input);
+
+        assert!(!text.contains("STOP"));
+        assert!(!text.contains("REMOVE"));
+        assert_eq!(next_command(CommandTarget::List), CommandTarget::Quit);
+        assert_eq!(previous_command(CommandTarget::Quit), CommandTarget::List);
+    }
+
+    #[test]
+    fn command_summary_uses_first_line_and_one_hundred_chars() {
+        let text = clipped_command_summary(&format!("{}EXTRA\nnext", "0123456789".repeat(10)));
+
+        assert_eq!(text, "0123456789".repeat(10));
     }
 }

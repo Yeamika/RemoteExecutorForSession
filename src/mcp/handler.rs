@@ -1992,7 +1992,13 @@ fn format_remote_exbash_run(run: &Value) -> String {
 }
 
 fn clipped_exbash_list_command(command: &str) -> String {
-    clipped_exbash_list_text(command)
+    command
+        .split(['\r', '\n'])
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(100)
+        .collect()
 }
 
 fn clipped_exbash_list_text(text: &str) -> String {
@@ -2714,6 +2720,7 @@ mod tests {
 
     #[test]
     fn exbash_task_list_line_clips_description_and_command() {
+        let long_command = format!("{}EXTRA\nnext", "0123456789".repeat(10));
         let line = format_exbash_task(&ExbashTaskSnapshot {
             async_id: "rex-test".to_string(),
             executor: "local".to_string(),
@@ -2724,31 +2731,33 @@ mod tests {
             exit_code: None,
             started_at: None,
             ended_at: None,
-            command: Some("012345678901234567890123456789EXTRA\nnext".to_string()),
+            command: Some(long_command),
             description: Some("abcdefghijklmnopqrstuvwxyz123456EXTRA\nnext".to_string()),
             total_output: Some(12),
         });
 
         assert!(line.contains(
-            "totalOutput=12 description=abcdefghijklmnopqrstuvwxyz1234 command=012345678901234567890123456789"
+            "totalOutput=12 description=abcdefghijklmnopqrstuvwxyz1234 command=0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
         ));
         assert!(!line.contains("EXTRA"));
+        assert!(!line.contains("next"));
         assert!(!line.contains("description=abcdefghijklmnopqrstuvwxyz123456"));
     }
 
     #[test]
     fn remote_exbash_list_line_clips_description_and_command() {
+        let long_command = format!("{}EXTRA\nnext", "abcdefghijklmnopqrstuvwxyz".repeat(4));
         let line = format_remote_exbash_run(&serde_json::json!({
             "asyncID": "rex-remote",
             "state": "running",
             "totalOutput": 8,
             "description": "012345678901234567890123456789EXTRA\nnext",
-            "command": "abcdefghijklmnopqrstuvwxyz123456EXTRA"
+            "command": long_command
         }));
 
         assert_eq!(
             line,
-            "- rex-remote running totalOutput=8 description=012345678901234567890123456789 command=abcdefghijklmnopqrstuvwxyz1234"
+            "- rex-remote running totalOutput=8 description=012345678901234567890123456789 command=abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuv"
         );
     }
 

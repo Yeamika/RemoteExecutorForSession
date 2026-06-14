@@ -62,6 +62,27 @@ struct ExbashTask {
     started_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ControlMessage {
+    #[serde(rename = "refs-ptyt.registered")]
+    Registered {
+        #[serde(rename = "slotID")]
+        slot_id: String,
+    },
+    #[serde(rename = "refs-ptyt.assign")]
+    Assign { task: ExbashTask },
+    #[serde(rename = "refs-ptyt.unassign")]
+    Unassign {
+        #[serde(rename = "asyncID", alias = "asyncId")]
+        async_id: String,
+        #[serde(default = "default_executor")]
+        executor: String,
+    },
+    #[serde(rename = "refs-ptyt.message")]
+    Message { message: String },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Input,
@@ -110,6 +131,9 @@ struct TerminalSize {
 enum LocalEvent {
     Key(KeyEvent),
     Resize { cols: u16, rows: u16 },
+    Assign(ExbashTask),
+    Unassign { async_id: String, executor: String },
+    Notice(String),
     Quit,
 }
 
@@ -168,7 +192,8 @@ async fn main() -> Result<()> {
     let size = resolve_terminal_size()?;
     let _guard = TerminalGuard::enter()?;
     let (tx, mut rx) = mpsc::unbounded_channel();
-    spawn_input_thread(tx);
+    spawn_input_thread(tx.clone());
+    spawn_control_connection(client.clone(), tx.clone());
 
     let mut out = stdout();
     let mut selected = 0usize;
@@ -188,6 +213,34 @@ async fn main() -> Result<()> {
             LocalEvent::Quit => break,
             LocalEvent::Resize { .. } => {
                 draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
+            }
+            LocalEvent::Notice(text) => {
+                message = Some(text);
+                draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
+            }
+            LocalEvent::Unassign { async_id, executor } => {
+                message = Some(format!("{executor}:{async_id} unassigned"));
+                refresh_task_list(&client, &mut list, &mut selected, &mut scroll, &mut message)
+                    .await;
+                draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
+            }
+            LocalEvent::Assign(task) => {
+                message = Some(format!("assigned {}:{}", task.executor, task.async_id));
+                draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
+                match attach_loop(&client, task, &mut rx, size).await {
+                    AttachAction::Quit => break,
+                    AttachAction::List | AttachAction::Switch(_) => {
+                        refresh_task_list(
+                            &client,
+                            &mut list,
+                            &mut selected,
+                            &mut scroll,
+                            &mut message,
+                        )
+                        .await;
+                        draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
+                    }
+                }
             }
             LocalEvent::Key(key) => match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') => break,
@@ -225,36 +278,17 @@ async fn main() -> Result<()> {
                     };
                     message = Some("connecting".to_string());
                     draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-                    match resolve_attach_target(&client, task).await {
-                        Ok(target) => {
-                            let action = run_attach(target, &mut rx, size).await;
-                            match action {
-                                AttachAction::Quit => break,
-                                AttachAction::List => {
-                                    match load_task_list(&client).await {
-                                        Ok(next) => {
-                                            list = next;
-                                            if selected >= list.tasks.len() {
-                                                selected = list.tasks.len().saturating_sub(1);
-                                            }
-                                            scroll =
-                                                clamp_scroll(scroll, selected, list.tasks.len());
-                                            message = None;
-                                        }
-                                        Err(err) => message = Some(err.to_string()),
-                                    }
-                                    draw_list(
-                                        &mut out,
-                                        &list,
-                                        selected,
-                                        scroll,
-                                        message.as_deref(),
-                                    )?;
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            message = Some(err.to_string());
+                    match attach_loop(&client, task, &mut rx, size).await {
+                        AttachAction::Quit => break,
+                        AttachAction::List | AttachAction::Switch(_) => {
+                            refresh_task_list(
+                                &client,
+                                &mut list,
+                                &mut selected,
+                                &mut scroll,
+                                &mut message,
+                            )
+                            .await;
                             draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
                         }
                     }
@@ -265,6 +299,100 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn refresh_task_list(
+    client: &RefsMcpClient,
+    list: &mut TaskList,
+    selected: &mut usize,
+    scroll: &mut usize,
+    message: &mut Option<String>,
+) {
+    match load_task_list(client).await {
+        Ok(next) => {
+            *list = next;
+            if *selected >= list.tasks.len() {
+                *selected = list.tasks.len().saturating_sub(1);
+            }
+            *scroll = clamp_scroll(*scroll, *selected, list.tasks.len());
+            *message = None;
+        }
+        Err(err) => *message = Some(err.to_string()),
+    }
+}
+
+fn spawn_control_connection(client: RefsMcpClient, tx: mpsc::UnboundedSender<LocalEvent>) {
+    tokio::spawn(async move {
+        let slot_id = random_client_id();
+        while !tx.is_closed() {
+            match run_control_connection(&client, &slot_id, &tx).await {
+                Ok(()) => {
+                    if tx.is_closed() {
+                        break;
+                    }
+                    let _ = tx.send(LocalEvent::Notice("scheduler disconnected".to_string()));
+                }
+                Err(err) => {
+                    if tx.is_closed() {
+                        break;
+                    }
+                    let _ = tx.send(LocalEvent::Notice(format!("scheduler: {err}")));
+                }
+            }
+            time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+async fn run_control_connection(
+    client: &RefsMcpClient,
+    slot_id: &str,
+    tx: &mpsc::UnboundedSender<LocalEvent>,
+) -> Result<()> {
+    let (ws, _) = connect_async(&client.endpoint.url)
+        .await
+        .with_context(|| format!("connect {}", client.endpoint.url))?;
+    let (mut write, mut read) = ws.split();
+    let register = json!({
+        "type": "refs-ptyt.register",
+        "sessionID": client.session.as_str(),
+        "slotID": slot_id,
+        "schedulable": true
+    });
+    write
+        .send(Message::Text(serde_json::to_string(&register)?.into()))
+        .await?;
+
+    while let Some(message) = read.next().await {
+        match message? {
+            Message::Text(text) => handle_control_message(&text, tx),
+            Message::Ping(data) => write.send(Message::Pong(data)).await?,
+            Message::Close(_) => break,
+            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_control_message(input: &str, tx: &mpsc::UnboundedSender<LocalEvent>) {
+    let Ok(message) = serde_json::from_str::<ControlMessage>(input) else {
+        return;
+    };
+    match message {
+        ControlMessage::Registered { slot_id } => {
+            drop(slot_id);
+        }
+        ControlMessage::Assign { task } => {
+            let _ = tx.send(LocalEvent::Assign(task));
+        }
+        ControlMessage::Unassign { async_id, executor } => {
+            let _ = tx.send(LocalEvent::Unassign { async_id, executor });
+        }
+        ControlMessage::Message { message } => {
+            let _ = tx.send(LocalEvent::Notice(message));
+        }
+    }
 }
 
 async fn load_task_list(client: &RefsMcpClient) -> Result<TaskList> {
@@ -302,9 +430,9 @@ async fn resolve_attach_target(client: &RefsMcpClient, task: ExbashTask) -> Resu
             "exbash",
             json!({
                 "mode": "attach",
-                "asyncID": task.async_id,
-                "executor": task.executor,
-                "scope": task.scope,
+                "asyncID": task.async_id.as_str(),
+                "executor": task.executor.as_str(),
+                "scope": task.scope.as_str(),
                 "read_timeout": 0
             }),
         )
@@ -316,10 +444,34 @@ async fn resolve_attach_target(client: &RefsMcpClient, task: ExbashTask) -> Resu
     Ok(AttachTarget { task, pty_url: url })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum AttachAction {
     List,
     Quit,
+    Switch(ExbashTask),
+}
+
+async fn attach_loop(
+    client: &RefsMcpClient,
+    task: ExbashTask,
+    rx: &mut mpsc::UnboundedReceiver<LocalEvent>,
+    size: TerminalSize,
+) -> AttachAction {
+    let mut task = task;
+    loop {
+        match resolve_attach_target(client, task).await {
+            Ok(target) => match run_attach(target, rx, size).await {
+                AttachAction::Switch(next) => task = next,
+                action => return action,
+            },
+            Err(err) => {
+                let mut out = stdout();
+                let _ = draw_error_message(&mut out, &err.to_string());
+                time::sleep(Duration::from_millis(1200)).await;
+                return AttachAction::List;
+            }
+        }
+    }
 }
 
 async fn run_attach(
@@ -407,6 +559,23 @@ async fn run_attach_inner(
                         let text = serde_json::to_string(&resize)?;
                         metrics.record_tx(text.len());
                         ws_write.send(Message::Text(text.into())).await?;
+                        render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+                    }
+                    LocalEvent::Assign(task) => {
+                        if same_task(&target.task, &task) {
+                            view.message = Some("assigned here".to_string());
+                            render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+                            continue;
+                        }
+                        return Ok(AttachAction::Switch(task));
+                    }
+                    LocalEvent::Unassign { async_id, executor } => {
+                        if target.task.async_id == async_id && target.task.executor == executor {
+                            return Ok(AttachAction::List);
+                        }
+                    }
+                    LocalEvent::Notice(message) => {
+                        view.message = Some(message);
                         render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
                     }
                     LocalEvent::Key(key) => {
@@ -1217,6 +1386,10 @@ fn is_running(task: &ExbashTask) -> bool {
     task_state(task) == "running"
 }
 
+fn same_task(left: &ExbashTask, right: &ExbashTask) -> bool {
+    left.async_id == right.async_id && left.executor == right.executor && left.scope == right.scope
+}
+
 fn exit_u32(task: &ExbashTask) -> Option<u32> {
     let state = task_state(task);
     let code = state.strip_prefix("exit:")?.parse::<i64>().ok()?;
@@ -1374,5 +1547,49 @@ mod tests {
         let text = clipped_command_summary(&format!("{}EXTRA\nnext", "0123456789".repeat(10)));
 
         assert_eq!(text, "0123456789".repeat(10));
+    }
+
+    #[test]
+    fn control_assign_message_parses_task() {
+        let message = r#"{
+            "type": "refs-ptyt.assign",
+            "task": {
+                "asyncID": "rex-1",
+                "scope": "workspace",
+                "executor": "remote",
+                "description": "build",
+                "command": "make",
+                "cwd": "/workspace/project",
+                "state": "running",
+                "startedAt": 10
+            }
+        }"#;
+
+        let ControlMessage::Assign { task } = serde_json::from_str(message).unwrap() else {
+            panic!("expected assign message");
+        };
+        assert_eq!(task.async_id, "rex-1");
+        assert_eq!(task.scope, "workspace");
+        assert_eq!(task.executor, "remote");
+    }
+
+    #[test]
+    fn same_task_compares_scope_executor_and_async_id() {
+        let left = ExbashTask {
+            async_id: "rex-1".to_string(),
+            scope: "local".to_string(),
+            executor: "remote".to_string(),
+            description: String::new(),
+            command: String::new(),
+            cwd: String::new(),
+            state: Some("running".to_string()),
+            exit_code: None,
+            started_at: Some(1),
+        };
+        let mut right = left.clone();
+        assert!(same_task(&left, &right));
+
+        right.scope = "workspace".to_string();
+        assert!(!same_task(&left, &right));
     }
 }

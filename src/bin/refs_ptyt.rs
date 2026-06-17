@@ -71,7 +71,7 @@ enum ControlMessage {
         slot_id: String,
     },
     #[serde(rename = "refs-ptyt.assign")]
-    Assign { task: ExbashTask },
+    Assign { task: Box<ExbashTask> },
     #[serde(rename = "refs-ptyt.unassign")]
     Unassign {
         #[serde(rename = "asyncID", alias = "asyncId")]
@@ -131,7 +131,7 @@ struct TerminalSize {
 enum LocalEvent {
     Key(KeyEvent),
     Resize { cols: u16, rows: u16 },
-    Assign(ExbashTask),
+    Assign(Box<ExbashTask>),
     Unassign { async_id: String, executor: String },
     Notice(String),
     Quit,
@@ -227,7 +227,7 @@ async fn main() -> Result<()> {
             LocalEvent::Assign(task) => {
                 message = Some(format!("assigned {}:{}", task.executor, task.async_id));
                 draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-                match attach_loop(&client, task, &mut rx, size).await {
+                match attach_loop(&client, *task, &mut rx, size).await {
                     AttachAction::Quit => break,
                     AttachAction::List | AttachAction::Switch(_) => {
                         refresh_task_list(
@@ -448,7 +448,7 @@ async fn resolve_attach_target(client: &RefsMcpClient, task: ExbashTask) -> Resu
 enum AttachAction {
     List,
     Quit,
-    Switch(ExbashTask),
+    Switch(Box<ExbashTask>),
 }
 
 async fn attach_loop(
@@ -461,7 +461,7 @@ async fn attach_loop(
     loop {
         match resolve_attach_target(client, task).await {
             Ok(target) => match run_attach(target, rx, size).await {
-                AttachAction::Switch(next) => task = next,
+                AttachAction::Switch(next) => task = *next,
                 action => return action,
             },
             Err(err) => {

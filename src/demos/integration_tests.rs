@@ -2303,6 +2303,132 @@ async fn manager_list_shells_routes_through_executor() {
 }
 
 #[tokio::test]
+async fn file_transfer_tool_prepares_same_port_http_request() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_file_transfer",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let prepared = call_structured(
+        &ep,
+        "ses_file_transfer",
+        "file_transfer",
+        json!({
+            "mode":"download",
+            "localPath":"./payload.bin",
+            "targetPath":"payload.bin",
+            "executor":"local"
+        }),
+    )
+    .await;
+    assert!(
+        prepared["error"].is_null(),
+        "file_transfer failed: {prepared:?}"
+    );
+    let structured = meta(&prepared);
+    assert_eq!(structured["metadata"]["mode"], json!("download"));
+    assert_eq!(structured["metadata"]["method"], json!("GET"));
+    assert_eq!(
+        structured["metadata"]["headers"]["X-RE-Path"],
+        json!("payload.bin")
+    );
+    assert_eq!(
+        structured["metadata"]["localPath"],
+        json!(dir.path().join("./payload.bin").to_string_lossy())
+    );
+    assert_eq!(structured["metadata"]["targetPath"], json!("payload.bin"));
+    let url = structured["metadata"]["url"].as_str().unwrap_or_default();
+    assert!(
+        url.starts_with("http://") && url.ends_with("/re-file/v1"),
+        "{url}"
+    );
+    assert!(text(&prepared).contains("GET http://"));
+}
+
+#[tokio::test]
+async fn file_transfer_local_path_accepts_local_hash_ref() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("source.bin");
+    std::fs::write(&file, b"transfer source\n").unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_file_transfer_hash_ref",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let read = call(
+        &ep,
+        "ses_file_transfer_hash_ref",
+        "read",
+        json!({
+            "fileKey": file.to_string_lossy(),
+            "executor": "local"
+        }),
+    )
+    .await;
+    assert!(
+        read["error"].is_null(),
+        "read should create local fileRef for transfer: {:?}",
+        read["error"]
+    );
+    let file_ref = file_ref_from_text(&text(&read))
+        .unwrap_or_else(|| panic!("read did not return fileRef: {read:?}"));
+
+    let prepared = call_structured(
+        &ep,
+        "ses_file_transfer_hash_ref",
+        "file_transfer",
+        json!({
+            "mode":"upload",
+            "localPath": file_ref,
+            "targetPath":"incoming/source.bin",
+            "executor":"local",
+            "overwrite": true
+        }),
+    )
+    .await;
+    assert!(
+        prepared["error"].is_null(),
+        "file_transfer failed: {prepared:?}"
+    );
+    let structured = meta(&prepared);
+    assert_eq!(structured["metadata"]["mode"], json!("upload"));
+    assert_eq!(structured["metadata"]["method"], json!("PUT"));
+    assert_eq!(
+        structured["metadata"]["localPath"],
+        json!(file.to_string_lossy())
+    );
+    assert_eq!(
+        structured["metadata"]["headers"]["X-RE-Path"],
+        json!("incoming/source.bin")
+    );
+    assert_eq!(
+        structured["metadata"]["headers"]["X-RE-Overwrite"],
+        json!("true")
+    );
+}
+
+#[tokio::test]
 async fn manager_request_reload_rebuilds_workspace_settings_and_reports_plaintext_errors() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);

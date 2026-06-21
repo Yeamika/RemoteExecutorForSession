@@ -1,6 +1,7 @@
 use remote_executor_for_session::demos::memory_host::MemorySessionHost;
 use remote_executor_for_session::jsonrpc::JsonRpcEndpoint;
 use remote_executor_for_session::mcp::create_session_mcp_with_manager;
+use remote_executor_for_session::ptyt::{RefsPtytGateway, RefsPtytScheduler};
 use remote_executor_for_session::rec::{new_manager, ShellManager, ToolContext};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -26,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     let ctx = ToolContext::new(Some(workdir.clone()));
     let endpoint = JsonRpcEndpoint::new(create_session_mcp_with_manager(ctx, host, shared, shell));
+    let gateway = RefsPtytGateway::new(Arc::new(endpoint), RefsPtytScheduler::default());
 
     eprintln!("rec_mcp_memory_server ready: workdir={}", workdir.display());
 
@@ -36,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(input) => handle_message(&endpoint, input).await,
+            Ok(input) => handle_message(&gateway, input).await,
             Err(error) => Some(error_response(Value::Null, -32700, error.to_string())),
         };
         if let Some(output) = response {
@@ -49,23 +51,23 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn handle_message(
-    endpoint: &JsonRpcEndpoint<impl remote_executor_for_session::JsonRpcHandler>,
+    gateway: &RefsPtytGateway<impl remote_executor_for_session::JsonRpcHandler>,
     input: Value,
 ) -> Option<Value> {
     if let Some(batch) = input.as_array() {
         let mut responses = Vec::new();
         for item in batch {
-            if let Some(response) = handle_single(endpoint, item.clone()).await {
+            if let Some(response) = handle_single(gateway, item.clone()).await {
                 responses.push(response);
             }
         }
         return (!responses.is_empty()).then_some(Value::Array(responses));
     }
-    handle_single(endpoint, input).await
+    handle_single(gateway, input).await
 }
 
 async fn handle_single(
-    endpoint: &JsonRpcEndpoint<impl remote_executor_for_session::JsonRpcHandler>,
+    gateway: &RefsPtytGateway<impl remote_executor_for_session::JsonRpcHandler>,
     input: Value,
 ) -> Option<Value> {
     let id = input.get("id").cloned()?;
@@ -80,7 +82,7 @@ async fn handle_single(
             input.get("params").cloned().unwrap_or(Value::Null),
         )),
         "ping" => Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
-        "tools/list" | "tools/call" => Some(endpoint.handle_value(input).await),
+        "tools/list" | "tools/call" => Some(gateway.handle_endpoint_value(input).await),
         _ => Some(error_response(
             id,
             -32601,

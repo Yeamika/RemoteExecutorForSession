@@ -1,6 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::style::{Attribute, SetAttribute};
 use crossterm::terminal::{self, ClearType};
 use crossterm::{cursor, execute, queue};
@@ -10,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{stdout, Stdout, Write};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -34,8 +37,6 @@ struct Args {
 
 #[derive(Clone, Debug, Default)]
 struct TaskList {
-    local_count: usize,
-    workspace_count: usize,
     tasks: Vec<ExbashTask>,
 }
 
@@ -93,9 +94,13 @@ enum Mode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandTarget {
     Input,
-    Identity,
     List,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlCommand {
+    SetSchedulable(bool),
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +122,7 @@ struct AttachView {
     command_target: CommandTarget,
     ctrl_c_count: u8,
     message: Option<String>,
+    mouse_tracking: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +136,7 @@ struct TerminalSize {
 #[derive(Clone, Debug)]
 enum LocalEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Resize { cols: u16, rows: u16 },
     Assign(Box<ExbashTask>),
     Unassign { async_id: String, executor: String },
@@ -193,9 +200,10 @@ async fn main() -> Result<()> {
     let _guard = TerminalGuard::enter()?;
     let (tx, mut rx) = mpsc::unbounded_channel();
     spawn_input_thread(tx.clone());
-    spawn_control_connection(client.clone(), tx.clone());
+    let control_tx = spawn_control_connection(client.clone(), tx.clone());
 
     let mut out = stdout();
+    let mut auto_schedule = true;
     let mut selected = 0usize;
     let mut scroll = 0usize;
     let mut message = None::<String>;
@@ -203,98 +211,228 @@ async fn main() -> Result<()> {
         message = Some(err.to_string());
         TaskList::default()
     });
-    draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
+    draw_list(
+        &mut out,
+        &list,
+        selected,
+        scroll,
+        message.as_deref(),
+        auto_schedule,
+    )?;
+    let mut spinner_tick = time::interval(Duration::from_millis(250));
+    spinner_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     loop {
-        let Some(event) = rx.recv().await else {
-            break;
-        };
-        match event {
-            LocalEvent::Quit => break,
-            LocalEvent::Resize { .. } => {
-                draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-            }
-            LocalEvent::Notice(text) => {
-                message = Some(text);
-                draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-            }
-            LocalEvent::Unassign { async_id, executor } => {
-                message = Some(format!("{executor}:{async_id} unassigned"));
-                refresh_task_list(&client, &mut list, &mut selected, &mut scroll, &mut message)
-                    .await;
-                draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-            }
-            LocalEvent::Assign(task) => {
-                message = Some(format!("assigned {}:{}", task.executor, task.async_id));
-                draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-                match attach_loop(&client, *task, &mut rx, size).await {
-                    AttachAction::Quit => break,
-                    AttachAction::List | AttachAction::Switch(_) => {
-                        refresh_task_list(
-                            &client,
-                            &mut list,
-                            &mut selected,
-                            &mut scroll,
-                            &mut message,
-                        )
-                        .await;
-                        draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                match event {
+                    LocalEvent::Quit => break,
+                    LocalEvent::Resize { .. } => {
+                        draw_list(
+                            &mut out,
+                            &list,
+                            selected,
+                            scroll,
+                            message.as_deref(),
+                            auto_schedule,
+                        )?;
                     }
-                }
-            }
-            LocalEvent::Key(key) => match key.code {
-                KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    message = Some("refreshing".to_string());
-                    draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-                    match load_task_list(&client).await {
-                        Ok(next) => {
-                            list = next;
-                            if selected >= list.tasks.len() {
-                                selected = list.tasks.len().saturating_sub(1);
+                    LocalEvent::Notice(text) => {
+                        message = Some(text);
+                        draw_list(
+                            &mut out,
+                            &list,
+                            selected,
+                            scroll,
+                            message.as_deref(),
+                            auto_schedule,
+                        )?;
+                    }
+                    LocalEvent::Unassign { async_id, executor } => {
+                        message = Some(format!("{executor}:{async_id} unassigned"));
+                        refresh_task_list(&client, &mut list, &mut selected, &mut scroll, &mut message)
+                            .await;
+                        draw_list(
+                            &mut out,
+                            &list,
+                            selected,
+                            scroll,
+                            message.as_deref(),
+                            auto_schedule,
+                        )?;
+                    }
+                    LocalEvent::Assign(task) => {
+                        if !auto_schedule {
+                            continue;
+                        }
+                        message = Some(format!("assigned {}:{}", task.executor, task.async_id));
+                        draw_list(
+                            &mut out,
+                            &list,
+                            selected,
+                            scroll,
+                            message.as_deref(),
+                            auto_schedule,
+                        )?;
+                        match attach_loop(
+                            &client,
+                            *task,
+                            &mut rx,
+                            size,
+                            &mut auto_schedule,
+                            &control_tx,
+                        ).await {
+                            AttachAction::Quit => break,
+                            AttachAction::List | AttachAction::Switch(_) => {
+                                refresh_task_list(
+                                    &client,
+                                    &mut list,
+                                    &mut selected,
+                                    &mut scroll,
+                                    &mut message,
+                                )
+                                .await;
+                                draw_list(
+                                    &mut out,
+                                    &list,
+                                    selected,
+                                    scroll,
+                                    message.as_deref(),
+                                    auto_schedule,
+                                )?;
+                            }
+                        }
+                    }
+                    LocalEvent::Key(key) => match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            message = Some("refreshing".to_string());
+                            draw_list(
+                                &mut out,
+                                &list,
+                                selected,
+                                scroll,
+                                message.as_deref(),
+                                auto_schedule,
+                            )?;
+                            match load_task_list(&client).await {
+                                Ok(next) => {
+                                    list = next;
+                                    if selected >= list.tasks.len() {
+                                        selected = list.tasks.len().saturating_sub(1);
+                                    }
+                                    scroll = clamp_scroll(scroll, selected, list.tasks.len());
+                                    message = None;
+                                }
+                                Err(err) => message = Some(err.to_string()),
+                            }
+                            draw_list(
+                                &mut out,
+                                &list,
+                                selected,
+                                scroll,
+                                message.as_deref(),
+                                auto_schedule,
+                            )?;
+                        }
+                        KeyCode::Up => {
+                            selected = selected.saturating_sub(1);
+                            scroll = clamp_scroll(scroll, selected, list.tasks.len());
+                            draw_list(
+                                &mut out,
+                                &list,
+                                selected,
+                                scroll,
+                                message.as_deref(),
+                                auto_schedule,
+                            )?;
+                        }
+                        KeyCode::Down => {
+                            if selected + 1 < list.tasks.len() {
+                                selected += 1;
                             }
                             scroll = clamp_scroll(scroll, selected, list.tasks.len());
-                            message = None;
+                            draw_list(
+                                &mut out,
+                                &list,
+                                selected,
+                                scroll,
+                                message.as_deref(),
+                                auto_schedule,
+                            )?;
                         }
-                        Err(err) => message = Some(err.to_string()),
-                    }
-                    draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-                }
-                KeyCode::Up => {
-                    selected = selected.saturating_sub(1);
-                    scroll = clamp_scroll(scroll, selected, list.tasks.len());
-                    draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-                }
-                KeyCode::Down => {
-                    if selected + 1 < list.tasks.len() {
-                        selected += 1;
-                    }
-                    scroll = clamp_scroll(scroll, selected, list.tasks.len());
-                    draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-                }
-                KeyCode::Enter => {
-                    let Some(task) = list.tasks.get(selected).cloned() else {
-                        continue;
-                    };
-                    message = Some("connecting".to_string());
-                    draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
-                    match attach_loop(&client, task, &mut rx, size).await {
-                        AttachAction::Quit => break,
-                        AttachAction::List | AttachAction::Switch(_) => {
-                            refresh_task_list(
+                        KeyCode::Enter => {
+                            let Some(task) = list.tasks.get(selected).cloned() else {
+                                continue;
+                            };
+                            message = Some("connecting".to_string());
+                            draw_list(
+                                &mut out,
+                                &list,
+                                selected,
+                                scroll,
+                                message.as_deref(),
+                                auto_schedule,
+                            )?;
+                            match attach_loop(
                                 &client,
-                                &mut list,
-                                &mut selected,
-                                &mut scroll,
-                                &mut message,
-                            )
-                            .await;
-                            draw_list(&mut out, &list, selected, scroll, message.as_deref())?;
+                                task,
+                                &mut rx,
+                                size,
+                                &mut auto_schedule,
+                                &control_tx,
+                            ).await {
+                                AttachAction::Quit => break,
+                                AttachAction::List | AttachAction::Switch(_) => {
+                                    refresh_task_list(
+                                        &client,
+                                        &mut list,
+                                        &mut selected,
+                                        &mut scroll,
+                                        &mut message,
+                                    )
+                                    .await;
+                                    draw_list(
+                                        &mut out,
+                                        &list,
+                                        selected,
+                                        scroll,
+                                        message.as_deref(),
+                                        auto_schedule,
+                                    )?;
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    LocalEvent::Mouse(mouse) => {
+                        if list_auto_hit(auto_schedule, mouse) {
+                            toggle_auto_schedule(&mut auto_schedule, &control_tx);
+                            draw_list(
+                                &mut out,
+                                &list,
+                                selected,
+                                scroll,
+                                message.as_deref(),
+                                auto_schedule,
+                            )?;
                         }
                     }
                 }
-                _ => {}
-            },
+            }
+            _ = spinner_tick.tick(), if has_running_task(&list) => {
+                draw_list(
+                    &mut out,
+                    &list,
+                    selected,
+                    scroll,
+                    message.as_deref(),
+                    auto_schedule,
+                )?;
+            }
         }
     }
 
@@ -321,11 +459,18 @@ async fn refresh_task_list(
     }
 }
 
-fn spawn_control_connection(client: RefsMcpClient, tx: mpsc::UnboundedSender<LocalEvent>) {
+fn spawn_control_connection(
+    client: RefsMcpClient,
+    tx: mpsc::UnboundedSender<LocalEvent>,
+) -> mpsc::UnboundedSender<ControlCommand> {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let slot_id = random_client_id();
+        let mut schedulable = true;
         while !tx.is_closed() {
-            match run_control_connection(&client, &slot_id, &tx).await {
+            match run_control_connection(&client, &slot_id, &tx, &mut cmd_rx, &mut schedulable)
+                .await
+            {
                 Ok(()) => {
                     if tx.is_closed() {
                         break;
@@ -342,37 +487,88 @@ fn spawn_control_connection(client: RefsMcpClient, tx: mpsc::UnboundedSender<Loc
             time::sleep(Duration::from_secs(1)).await;
         }
     });
+    cmd_tx
 }
 
 async fn run_control_connection(
     client: &RefsMcpClient,
     slot_id: &str,
     tx: &mpsc::UnboundedSender<LocalEvent>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<ControlCommand>,
+    schedulable: &mut bool,
 ) -> Result<()> {
     let (ws, _) = connect_async(&client.endpoint.url)
         .await
         .with_context(|| format!("connect {}", client.endpoint.url))?;
     let (mut write, mut read) = ws.split();
-    let register = json!({
-        "type": "refs-ptyt.register",
-        "sessionID": client.session.as_str(),
-        "slotID": slot_id,
-        "schedulable": true
-    });
-    write
-        .send(Message::Text(serde_json::to_string(&register)?.into()))
-        .await?;
+    drain_control_commands(schedulable, cmd_rx);
+    send_control_register(&mut write, client, slot_id, *schedulable).await?;
 
-    while let Some(message) = read.next().await {
-        match message? {
-            Message::Text(text) => handle_control_message(&text, tx),
-            Message::Ping(data) => write.send(Message::Pong(data)).await?,
-            Message::Close(_) => break,
-            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+    loop {
+        tokio::select! {
+            command = cmd_rx.recv() => {
+                let Some(command) = command else {
+                    return Ok(());
+                };
+                apply_control_command(schedulable, command);
+                send_control_register(&mut write, client, slot_id, *schedulable).await?;
+            }
+            message = read.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                match message? {
+                    Message::Text(text) => handle_control_message(&text, tx),
+                    Message::Ping(data) => write.send(Message::Pong(data)).await?,
+                    Message::Close(_) => break,
+                    Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+async fn send_control_register(
+    write: &mut ClientWsSink,
+    client: &RefsMcpClient,
+    slot_id: &str,
+    schedulable: bool,
+) -> Result<()> {
+    let register = json!({
+        "type": "refs-ptyt.register",
+        "sessionID": client.session.as_str(),
+        "slotID": slot_id,
+        "schedulable": schedulable
+    });
+    write
+        .send(Message::Text(serde_json::to_string(&register)?.into()))
+        .await
+        .map_err(Into::into)
+}
+
+fn drain_control_commands(
+    schedulable: &mut bool,
+    cmd_rx: &mut mpsc::UnboundedReceiver<ControlCommand>,
+) {
+    while let Ok(command) = cmd_rx.try_recv() {
+        apply_control_command(schedulable, command);
+    }
+}
+
+fn apply_control_command(schedulable: &mut bool, command: ControlCommand) {
+    match command {
+        ControlCommand::SetSchedulable(value) => *schedulable = value,
+    }
+}
+
+fn toggle_auto_schedule(
+    auto_schedule: &mut bool,
+    control_tx: &mpsc::UnboundedSender<ControlCommand>,
+) {
+    *auto_schedule = !*auto_schedule;
+    let _ = control_tx.send(ControlCommand::SetSchedulable(*auto_schedule));
 }
 
 fn handle_control_message(input: &str, tx: &mpsc::UnboundedSender<LocalEvent>) {
@@ -402,9 +598,6 @@ async fn load_task_list(client: &RefsMcpClient) -> Result<TaskList> {
     let workspace_meta = list_metadata(&workspace)?;
     let local_tasks = tasks_from_metadata(local_meta, "local")?;
     let workspace_tasks = tasks_from_metadata(workspace_meta, "workspace")?;
-    let local_count = usize_field(local_meta, "localCount").unwrap_or(local_tasks.len());
-    let workspace_count =
-        usize_field(workspace_meta, "workspaceCount").unwrap_or(workspace_tasks.len());
     let mut tasks = Vec::new();
     tasks.extend(workspace_tasks);
     tasks.extend(local_tasks);
@@ -417,11 +610,7 @@ async fn load_task_list(client: &RefsMcpClient) -> Result<TaskList> {
                 .cmp(&a.started_at.unwrap_or_default())
         })
     });
-    Ok(TaskList {
-        local_count,
-        workspace_count,
-        tasks,
-    })
+    Ok(TaskList { tasks })
 }
 
 async fn resolve_attach_target(client: &RefsMcpClient, task: ExbashTask) -> Result<AttachTarget> {
@@ -433,6 +622,7 @@ async fn resolve_attach_target(client: &RefsMcpClient, task: ExbashTask) -> Resu
                 "asyncID": task.async_id.as_str(),
                 "executor": task.executor.as_str(),
                 "scope": task.scope.as_str(),
+                "refsPtytResolve": true,
                 "read_timeout": 0
             }),
         )
@@ -456,17 +646,19 @@ async fn attach_loop(
     task: ExbashTask,
     rx: &mut mpsc::UnboundedReceiver<LocalEvent>,
     size: TerminalSize,
+    auto_schedule: &mut bool,
+    control_tx: &mpsc::UnboundedSender<ControlCommand>,
 ) -> AttachAction {
     let mut task = task;
     loop {
         match resolve_attach_target(client, task).await {
-            Ok(target) => match run_attach(target, rx, size).await {
+            Ok(target) => match run_attach(target, rx, size, auto_schedule, control_tx).await {
                 AttachAction::Switch(next) => task = *next,
                 action => return action,
             },
             Err(err) => {
                 let mut out = stdout();
-                let _ = draw_error_message(&mut out, &err.to_string());
+                let _ = draw_error_message(&mut out, &err.to_string(), *auto_schedule);
                 time::sleep(Duration::from_millis(1200)).await;
                 return AttachAction::List;
             }
@@ -478,12 +670,14 @@ async fn run_attach(
     target: AttachTarget,
     rx: &mut mpsc::UnboundedReceiver<LocalEvent>,
     size: TerminalSize,
+    auto_schedule: &mut bool,
+    control_tx: &mpsc::UnboundedSender<ControlCommand>,
 ) -> AttachAction {
-    match run_attach_inner(target, rx, size).await {
+    match run_attach_inner(target, rx, size, auto_schedule, control_tx).await {
         Ok(action) => action,
         Err(err) => {
             let mut out = stdout();
-            let _ = draw_error_message(&mut out, &err.to_string());
+            let _ = draw_error_message(&mut out, &err.to_string(), *auto_schedule);
             time::sleep(Duration::from_millis(1200)).await;
             AttachAction::List
         }
@@ -494,6 +688,8 @@ async fn run_attach_inner(
     target: AttachTarget,
     rx: &mut mpsc::UnboundedReceiver<LocalEvent>,
     size: TerminalSize,
+    auto_schedule: &mut bool,
+    control_tx: &mpsc::UnboundedSender<ControlCommand>,
 ) -> Result<AttachAction> {
     let TerminalSize {
         local_cols,
@@ -531,18 +727,28 @@ async fn run_attach_inner(
         command_target: CommandTarget::Input,
         ctrl_c_count: 0,
         message: None,
+        mouse_tracking: false,
     };
     let mut metrics = Metrics {
         next_ping_seq: 1,
         ..Metrics::default()
     };
-    render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+    render_attach(
+        &mut out,
+        &parser,
+        &view,
+        &target.task,
+        &metrics,
+        *auto_schedule,
+    )?;
 
     let mut ping_tick = time::interval_at(
         time::Instant::now() + Duration::from_secs(3),
         Duration::from_secs(3),
     );
     ping_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut spinner_tick = time::interval(Duration::from_millis(250));
+    spinner_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut ctrl_c_streak = 0u8;
 
     loop {
@@ -559,12 +765,29 @@ async fn run_attach_inner(
                         let text = serde_json::to_string(&resize)?;
                         metrics.record_tx(text.len());
                         ws_write.send(Message::Text(text.into())).await?;
-                        render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+                        render_attach(
+                            &mut out,
+                            &parser,
+                            &view,
+                            &target.task,
+                            &metrics,
+                            *auto_schedule,
+                        )?;
                     }
                     LocalEvent::Assign(task) => {
+                        if !*auto_schedule {
+                            continue;
+                        }
                         if same_task(&target.task, &task) {
                             view.message = Some("assigned here".to_string());
-                            render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+                            render_attach(
+                                &mut out,
+                                &parser,
+                                &view,
+                                &target.task,
+                                &metrics,
+                                *auto_schedule,
+                            )?;
                             continue;
                         }
                         return Ok(AttachAction::Switch(task));
@@ -576,7 +799,14 @@ async fn run_attach_inner(
                     }
                     LocalEvent::Notice(message) => {
                         view.message = Some(message);
-                        render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+                        render_attach(
+                            &mut out,
+                            &parser,
+                            &view,
+                            &target.task,
+                            &metrics,
+                            *auto_schedule,
+                        )?;
                     }
                     LocalEvent::Key(key) => {
                         match process_attach_key(
@@ -589,6 +819,26 @@ async fn run_attach_inner(
                                 out: &mut out,
                                 ws_write: &mut ws_write,
                                 ctrl_c_streak: &mut ctrl_c_streak,
+                                auto_schedule: *auto_schedule,
+                            },
+                        ).await? {
+                            AttachActionRequest::Continue => {}
+                            AttachActionRequest::List => return Ok(AttachAction::List),
+                            AttachActionRequest::Quit => return Ok(AttachAction::Quit),
+                        }
+                    }
+                    LocalEvent::Mouse(mouse) => {
+                        match process_attach_mouse(
+                            mouse,
+                            AttachMouseContext {
+                                parser: &parser,
+                                view: &mut view,
+                                task: &target.task,
+                                metrics: &mut metrics,
+                                out: &mut out,
+                                ws_write: &mut ws_write,
+                                auto_schedule,
+                                control_tx,
                             },
                         ).await? {
                             AttachActionRequest::Continue => {}
@@ -597,6 +847,16 @@ async fn run_attach_inner(
                         }
                     }
                 }
+            }
+            _ = spinner_tick.tick(), if should_animate_attach(&view, &target.task) => {
+                render_attach(
+                    &mut out,
+                    &parser,
+                    &view,
+                    &target.task,
+                    &metrics,
+                    *auto_schedule,
+                )?;
             }
             _ = ping_tick.tick() => {
                 if metrics.ping_due() {
@@ -610,8 +870,16 @@ async fn run_attach_inner(
                 match msg? {
                     Message::Binary(data) => {
                         metrics.record_rx(data.len(), true);
+                        update_mouse_tracking(&mut view, &data);
                         parser.process(&data);
-                        render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+                        render_attach(
+                            &mut out,
+                            &parser,
+                            &view,
+                            &target.task,
+                            &metrics,
+                            *auto_schedule,
+                        )?;
                     }
                     Message::Text(text) => {
                         metrics.record_rx(text.len(), false);
@@ -623,11 +891,25 @@ async fn run_attach_inner(
                                 view.pty_rows = rows;
                                 view.exit_code = exit_code;
                                 parser.screen_mut().set_size(rows, cols);
-                                render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+                                render_attach(
+                                    &mut out,
+                                    &parser,
+                                    &view,
+                                    &target.task,
+                                    &metrics,
+                                    *auto_schedule,
+                                )?;
                             }
                             Ok(ServerText::Error { message }) | Ok(ServerText::Info { message }) => {
                                 view.message = Some(message);
-                                render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+                                render_attach(
+                                    &mut out,
+                                    &parser,
+                                    &view,
+                                    &target.task,
+                                    &metrics,
+                                    *auto_schedule,
+                                )?;
                             }
                             Ok(ServerText::Sessions { .. }) | Ok(ServerText::Session { .. }) => {}
                             Err(_) => {}
@@ -642,7 +924,14 @@ async fn run_attach_inner(
                     Message::Pong(data) => {
                         metrics.record_rx(data.len(), false);
                         if metrics.note_pong(&data) {
-                            render_attach(&mut out, &parser, &view, &target.task, &metrics)?;
+                            render_attach(
+                                &mut out,
+                                &parser,
+                                &view,
+                                &target.task,
+                                &metrics,
+                                *auto_schedule,
+                            )?;
                         }
                     }
                     Message::Frame(_) => {}
@@ -667,6 +956,125 @@ struct AttachKeyContext<'a> {
     out: &'a mut Stdout,
     ws_write: &'a mut ClientWsSink,
     ctrl_c_streak: &'a mut u8,
+    auto_schedule: bool,
+}
+
+struct AttachMouseContext<'a> {
+    parser: &'a vt100::Parser,
+    view: &'a mut AttachView,
+    task: &'a ExbashTask,
+    metrics: &'a mut Metrics,
+    out: &'a mut Stdout,
+    ws_write: &'a mut ClientWsSink,
+    auto_schedule: &'a mut bool,
+    control_tx: &'a mpsc::UnboundedSender<ControlCommand>,
+}
+
+async fn process_attach_mouse(
+    mouse: MouseEvent,
+    context: AttachMouseContext<'_>,
+) -> Result<AttachActionRequest> {
+    let AttachMouseContext {
+        parser,
+        view,
+        task,
+        metrics,
+        out,
+        ws_write,
+        auto_schedule,
+        control_tx,
+    } = context;
+
+    if mouse.row == view.local_rows.saturating_sub(1) {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && status_auto_hit(
+                *auto_schedule,
+                view.local_cols,
+                view.local_rows,
+                mouse.column,
+            )
+        {
+            toggle_auto_schedule(auto_schedule, control_tx);
+            render_attach(out, parser, view, task, metrics, *auto_schedule)?;
+        } else if view.message.is_none()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            match view.mode {
+                Mode::Input | Mode::Link => {
+                    if status_identity_hit(view, mouse.column) {
+                        request_control(ws_write, metrics).await?;
+                    } else {
+                        view.mode = Mode::Command;
+                        view.command_target = CommandTarget::Input;
+                        view.ctrl_c_count = 0;
+                    }
+                    render_attach(out, parser, view, task, metrics, *auto_schedule)?;
+                }
+                Mode::Command => {
+                    if let Some(target) =
+                        command_target_at_column(view.command_target, mouse.column)
+                    {
+                        view.command_target = target;
+                        match target {
+                            CommandTarget::Input => view.mode = Mode::Input,
+                            CommandTarget::List => return Ok(AttachActionRequest::List),
+                            CommandTarget::Quit => return Ok(AttachActionRequest::Quit),
+                        }
+                    }
+                    render_attach(out, parser, view, task, metrics, *auto_schedule)?;
+                }
+            }
+        } else if view.mode == Mode::Command
+            && matches!(
+                mouse.kind,
+                MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left)
+            )
+        {
+            if let Some(target) = command_target_at_column(view.command_target, mouse.column) {
+                view.command_target = target;
+                render_attach(out, parser, view, task, metrics, *auto_schedule)?;
+            }
+        }
+        return Ok(AttachActionRequest::Continue);
+    }
+
+    if view.mode == Mode::Command || !view.mouse_tracking {
+        return Ok(AttachActionRequest::Continue);
+    }
+    if mouse.row >= view.pty_rows || mouse.column >= view.pty_cols {
+        return Ok(AttachActionRequest::Continue);
+    }
+
+    if let Some(bytes) = mouse_to_sgr_bytes(mouse) {
+        metrics.record_tx(bytes.len());
+        ws_write.send(Message::Binary(bytes.into())).await?;
+    }
+    Ok(AttachActionRequest::Continue)
+}
+
+fn command_target_at_column(selected: CommandTarget, column: u16) -> Option<CommandTarget> {
+    let mut start = UnicodeWidthStr::width("[:] ");
+    let column = column as usize;
+    for (target, label) in command_targets() {
+        let display = if target == selected {
+            format!("[{label}]")
+        } else {
+            label.to_string()
+        };
+        let end = start + UnicodeWidthStr::width(display.as_str());
+        if column >= start && column < end {
+            return Some(target);
+        }
+        start = end + 2;
+    }
+    None
+}
+
+async fn request_control(ws_write: &mut ClientWsSink, metrics: &mut Metrics) -> Result<()> {
+    let msg = serde_json::to_string(&ClientText::RequestControl)?;
+    metrics.record_tx(msg.len());
+    ws_write.send(Message::Text(msg.into())).await?;
+    Ok(())
 }
 
 async fn process_attach_key(
@@ -681,6 +1089,7 @@ async fn process_attach_key(
         out,
         ws_write,
         ctrl_c_streak,
+        auto_schedule,
     } = context;
     match view.mode {
         Mode::Input | Mode::Link => {
@@ -698,7 +1107,7 @@ async fn process_attach_key(
                     view.mode = Mode::Command;
                     view.command_target = CommandTarget::Input;
                 }
-                render_attach(out, parser, view, task, metrics)?;
+                render_attach(out, parser, view, task, metrics, auto_schedule)?;
                 return Ok(AttachActionRequest::Continue);
             }
 
@@ -715,7 +1124,7 @@ async fn process_attach_key(
                 let bytes = b"\t".to_vec();
                 metrics.record_tx(bytes.len());
                 ws_write.send(Message::Binary(bytes.into())).await?;
-                render_attach(out, parser, view, task, metrics)?;
+                render_attach(out, parser, view, task, metrics, auto_schedule)?;
                 return Ok(AttachActionRequest::Continue);
             }
 
@@ -724,7 +1133,7 @@ async fn process_attach_key(
                 ws_write.send(Message::Binary(bytes.into())).await?;
             }
             if had_ctrl_c_hint {
-                render_attach(out, parser, view, task, metrics)?;
+                render_attach(out, parser, view, task, metrics, auto_schedule)?;
             }
             Ok(AttachActionRequest::Continue)
         }
@@ -738,12 +1147,6 @@ async fn process_attach_key(
                 }
                 KeyCode::Enter => match view.command_target {
                     CommandTarget::Input => view.mode = Mode::Input,
-                    CommandTarget::Identity => {
-                        let msg = serde_json::to_string(&ClientText::RequestControl)?;
-                        metrics.record_tx(msg.len());
-                        ws_write.send(Message::Text(msg.into())).await?;
-                        view.mode = Mode::Input;
-                    }
                     CommandTarget::List => return Ok(AttachActionRequest::List),
                     CommandTarget::Quit => return Ok(AttachActionRequest::Quit),
                 },
@@ -753,7 +1156,7 @@ async fn process_attach_key(
                 }
                 _ => {}
             }
-            render_attach(out, parser, view, task, metrics)?;
+            render_attach(out, parser, view, task, metrics, auto_schedule)?;
             Ok(AttachActionRequest::Continue)
         }
     }
@@ -951,19 +1354,13 @@ fn tasks_from_metadata(metadata: &Value, scope: &str) -> Result<Vec<ExbashTask>>
         .map_err(Into::into)
 }
 
-fn usize_field(value: &Value, field: &str) -> Option<usize> {
-    value
-        .get(field)
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-}
-
 fn draw_list(
     out: &mut Stdout,
     list: &TaskList,
     selected: usize,
     scroll: usize,
     message: Option<&str>,
+    auto_schedule: bool,
 ) -> Result<()> {
     let (cols, rows) = terminal::size()?;
     queue!(out, cursor::Hide, terminal::Clear(ClearType::All))?;
@@ -1023,7 +1420,7 @@ fn draw_list(
         )?;
         write!(out, "{}", trim_to_width(message, cols as usize))?;
     }
-    draw_list_status(out, list.local_count, list.workspace_count, cols, rows)?;
+    draw_list_status(out, list.tasks.get(selected), cols, rows, auto_schedule)?;
     out.flush()?;
     Ok(())
 }
@@ -1059,14 +1456,19 @@ fn draw_empty_list(out: &mut Stdout, cols: u16, body_rows: u16) -> Result<()> {
 
 fn draw_list_status(
     out: &mut Stdout,
-    local: usize,
-    workspace: usize,
+    task: Option<&ExbashTask>,
     cols: u16,
     rows: u16,
+    auto_schedule: bool,
 ) -> Result<()> {
-    let left = format!("local {local}; workspace {workspace}  | enter attach  r refresh  q quit");
-    let marker = size_marker(cols, rows);
+    let left = list_status_body(task);
+    let marker = status_marker(auto_schedule, cols, rows);
     draw_status_with_marker(out, rows.saturating_sub(1), cols, &left, &marker)
+}
+
+fn list_status_body(task: Option<&ExbashTask>) -> String {
+    let icon = task.map(task_state_icon).unwrap_or("[?]");
+    format!("[:]{icon}SW: INPUT LIST QUIT")
 }
 
 fn render_attach(
@@ -1075,6 +1477,7 @@ fn render_attach(
     view: &AttachView,
     task: &ExbashTask,
     metrics: &Metrics,
+    auto_schedule: bool,
 ) -> Result<()> {
     let content_rows = view.local_rows.saturating_sub(1);
     let draw_cols = view.local_cols.min(view.pty_cols);
@@ -1101,10 +1504,10 @@ fn render_attach(
             view.local_rows.saturating_sub(1),
             view.local_cols,
             message,
-            &size_marker(view.local_cols, view.local_rows),
+            &status_marker(auto_schedule, view.local_cols, view.local_rows),
         )?;
     } else {
-        draw_attach_status(out, view, task, metrics)?;
+        draw_attach_status(out, view, task, metrics, auto_schedule)?;
     }
     if view.mode == Mode::Command {
         queue!(
@@ -1127,20 +1530,26 @@ fn draw_attach_status(
     view: &AttachView,
     task: &ExbashTask,
     metrics: &Metrics,
+    auto_schedule: bool,
 ) -> Result<()> {
+    let body = attach_status_body(view, task, metrics);
+    draw_status_with_marker(
+        out,
+        view.local_rows.saturating_sub(1),
+        view.local_cols,
+        &body,
+        &status_marker(auto_schedule, view.local_cols, view.local_rows),
+    )
+}
+
+fn attach_status_body(view: &AttachView, task: &ExbashTask, metrics: &Metrics) -> String {
     let role = role_symbol(&view.role);
     let state = attach_state_icon(view, task);
-    let body = match view.mode {
+    match view.mode {
         Mode::Input if view.ctrl_c_count > 0 => {
             format!("[ctrl c x{}] x3 to command mode", view.ctrl_c_count)
         }
-        Mode::Input => format!(
-            "[>] [{role}:{}]  {state} {}:{}  {}",
-            view.id,
-            task.executor,
-            task.async_id,
-            task_title(task)
-        ),
+        Mode::Input => format!("[>] [{role}:{}]  {state} {}", view.id, task_title(task)),
         Mode::Link => format!(
             "[~] [{role}:{}]  rtt={} rx={} tx={} idle={}  {state} {}:{}",
             view.id,
@@ -1151,20 +1560,8 @@ fn draw_attach_status(
             task.executor,
             task.async_id
         ),
-        Mode::Command => format!(
-            "[:] {}  {state} {}:{}",
-            command_targets_text(view.command_target),
-            task.executor,
-            task.async_id
-        ),
-    };
-    draw_status_with_marker(
-        out,
-        view.local_rows.saturating_sub(1),
-        view.local_cols,
-        &body,
-        &size_marker(view.local_cols, view.local_rows),
-    )
+        Mode::Command => format!("[:] {}  {state}", command_targets_text(view.command_target)),
+    }
 }
 
 fn draw_status_with_marker(
@@ -1203,9 +1600,44 @@ fn size_marker(cols: u16, rows: u16) -> String {
     format!("[{cols}x{rows}]")
 }
 
-fn draw_error_message(out: &mut Stdout, message: &str) -> Result<()> {
+fn status_marker(auto_schedule: bool, cols: u16, rows: u16) -> String {
+    format!("{} {}", auto_marker(auto_schedule), size_marker(cols, rows))
+}
+
+fn auto_marker(auto_schedule: bool) -> &'static str {
+    if auto_schedule {
+        "[Auto]"
+    } else {
+        "[    ]"
+    }
+}
+
+fn status_auto_hit(auto_schedule: bool, cols: u16, rows: u16, column: u16) -> bool {
+    let marker = status_marker(auto_schedule, cols, rows);
+    let marker_width = UnicodeWidthStr::width(marker.as_str());
+    let width = cols as usize;
+    if marker_width > width {
+        return false;
+    }
+    let start = width - marker_width;
+    let end = start + UnicodeWidthStr::width(auto_marker(auto_schedule));
+    let column = column as usize;
+    column >= start && column < end
+}
+
+fn list_auto_hit(auto_schedule: bool, mouse: MouseEvent) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    let Ok((cols, rows)) = terminal::size() else {
+        return false;
+    };
+    mouse.row == rows.saturating_sub(1) && status_auto_hit(auto_schedule, cols, rows, mouse.column)
+}
+
+fn draw_error_message(out: &mut Stdout, message: &str, auto_schedule: bool) -> Result<()> {
     let (cols, rows) = terminal::size()?;
-    let marker = size_marker(cols, rows);
+    let marker = status_marker(auto_schedule, cols, rows);
     draw_status_with_marker(
         out,
         rows.saturating_sub(1),
@@ -1229,6 +1661,9 @@ fn spawn_input_thread(tx: mpsc::UnboundedSender<LocalEvent>) {
                         break;
                     }
                     let _ = tx.send(LocalEvent::Key(key));
+                }
+                Event::Mouse(mouse) => {
+                    let _ = tx.send(LocalEvent::Mouse(mouse));
                 }
                 Event::Resize(cols, rows) => {
                     let _ = tx.send(LocalEvent::Resize { cols, rows });
@@ -1271,6 +1706,96 @@ fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     } else {
         Some(bytes)
     }
+}
+
+fn mouse_to_sgr_bytes(mouse: MouseEvent) -> Option<Vec<u8>> {
+    let (base, final_byte) = match mouse.kind {
+        MouseEventKind::Down(button) => (mouse_button_code(button)?, b'M'),
+        MouseEventKind::Up(button) => (mouse_button_code(button)?, b'm'),
+        MouseEventKind::Drag(button) => (mouse_button_code(button)? + 32, b'M'),
+        MouseEventKind::Moved => (35, b'M'),
+        MouseEventKind::ScrollUp => (64, b'M'),
+        MouseEventKind::ScrollDown => (65, b'M'),
+        MouseEventKind::ScrollLeft => (66, b'M'),
+        MouseEventKind::ScrollRight => (67, b'M'),
+    };
+    let code = base + mouse_modifier_code(mouse.modifiers);
+    let col = mouse.column.saturating_add(1);
+    let row = mouse.row.saturating_add(1);
+    Some(format!("\x1b[<{code};{col};{row}{}", final_byte as char).into_bytes())
+}
+
+fn mouse_button_code(button: MouseButton) -> Option<u16> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+    }
+}
+
+fn mouse_modifier_code(modifiers: KeyModifiers) -> u16 {
+    let mut code = 0;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        code += 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        code += 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        code += 16;
+    }
+    code
+}
+
+fn status_identity_hit(view: &AttachView, column: u16) -> bool {
+    if !matches!(view.mode, Mode::Input | Mode::Link) {
+        return false;
+    }
+    let prefix = match view.mode {
+        Mode::Input => "[>] ",
+        Mode::Link => "[~] ",
+        Mode::Command => return false,
+    };
+    let role = role_symbol(&view.role);
+    let identity = format!("[{role}:{}]", view.id);
+    let start = UnicodeWidthStr::width(prefix);
+    let end = start + UnicodeWidthStr::width(identity.as_str());
+    let column = column as usize;
+    column >= start && column < end
+}
+
+fn update_mouse_tracking(view: &mut AttachView, data: &[u8]) {
+    let mut index = 0;
+    while index + 3 <= data.len() {
+        let Some(relative) = data[index..]
+            .windows(3)
+            .position(|window| window == b"\x1b[?")
+        else {
+            break;
+        };
+        let params_start = index + relative + 3;
+        let mut params_end = params_start;
+        while params_end < data.len()
+            && (data[params_end].is_ascii_digit() || data[params_end] == b';')
+        {
+            params_end += 1;
+        }
+        if params_end < data.len()
+            && matches!(data[params_end], b'h' | b'l')
+            && private_modes_include_mouse(&data[params_start..params_end])
+        {
+            view.mouse_tracking = data[params_end] == b'h';
+        }
+        index = params_end.saturating_add(1);
+    }
+}
+
+fn private_modes_include_mouse(params: &[u8]) -> bool {
+    params
+        .split(|byte| *byte == b';')
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .filter_map(|part| part.parse::<u16>().ok())
+        .any(|mode| matches!(mode, 1000 | 1002 | 1003 | 1005 | 1006 | 1015))
 }
 
 fn ctrl_byte(c: char) -> Option<u8> {
@@ -1331,15 +1856,39 @@ fn task_subtitle(task: &ExbashTask) -> String {
     )
 }
 
+const RUNNING_ICONS: [&str; 10] = [
+    "[⠋]", "[⠙]", "[⠹]", "[⠸]", "[⠼]", "[⠴]", "[⠦]", "[⠧]", "[⠇]", "[⠏]",
+];
+
 fn task_state_icon(task: &ExbashTask) -> &'static str {
     match task_state(task).as_str() {
-        "running" => "[▶]",
+        "running" => running_state_icon(running_icon_frame()),
         "exit:0" => "[✓]",
         "timeout" | "stop" => "[!]",
         "unknown" => "[?]",
         state if state.starts_with("exit:") => "[E]",
         _ => "[?]",
     }
+}
+
+fn running_state_icon(frame: usize) -> &'static str {
+    RUNNING_ICONS[frame % RUNNING_ICONS.len()]
+}
+
+fn running_icon_frame() -> usize {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    ((millis / 250) % RUNNING_ICONS.len() as u128) as usize
+}
+
+fn has_running_task(list: &TaskList) -> bool {
+    list.tasks.iter().any(is_running)
+}
+
+fn should_animate_attach(view: &AttachView, task: &ExbashTask) -> bool {
+    view.exit_code.is_none() && is_running(task)
 }
 
 fn attach_state_icon(view: &AttachView, task: &ExbashTask) -> &'static str {
@@ -1405,14 +1954,7 @@ fn role_symbol(role: &str) -> &'static str {
 }
 
 fn command_targets_text(selected: CommandTarget) -> String {
-    let items = [
-        (CommandTarget::Input, "INPUT"),
-        (CommandTarget::Identity, "IDENTITY"),
-        (CommandTarget::List, "LIST"),
-        (CommandTarget::Quit, "QUIT"),
-    ];
-    items
-        .into_iter()
+    command_targets()
         .map(|(target, label)| {
             if target == selected {
                 format!("[{label}]")
@@ -1424,10 +1966,18 @@ fn command_targets_text(selected: CommandTarget) -> String {
         .join("  ")
 }
 
+fn command_targets() -> impl Iterator<Item = (CommandTarget, &'static str)> {
+    [
+        (CommandTarget::Input, "INPUT"),
+        (CommandTarget::List, "LIST"),
+        (CommandTarget::Quit, "QUIT"),
+    ]
+    .into_iter()
+}
+
 fn next_command(command: CommandTarget) -> CommandTarget {
     match command {
-        CommandTarget::Input => CommandTarget::Identity,
-        CommandTarget::Identity => CommandTarget::List,
+        CommandTarget::Input => CommandTarget::List,
         CommandTarget::List => CommandTarget::Quit,
         CommandTarget::Quit => CommandTarget::Input,
     }
@@ -1436,8 +1986,7 @@ fn next_command(command: CommandTarget) -> CommandTarget {
 fn previous_command(command: CommandTarget) -> CommandTarget {
     match command {
         CommandTarget::Input => CommandTarget::Quit,
-        CommandTarget::Identity => CommandTarget::Input,
-        CommandTarget::List => CommandTarget::Identity,
+        CommandTarget::List => CommandTarget::Input,
         CommandTarget::Quit => CommandTarget::List,
     }
 }
@@ -1514,15 +2063,66 @@ fn default_executor() -> String {
 mod tests {
     use super::*;
 
+    fn test_attach_view() -> AttachView {
+        AttachView {
+            id: "client-123".to_string(),
+            role: "Viewer".to_string(),
+            pty_cols: 80,
+            pty_rows: 23,
+            exit_code: None,
+            local_cols: 80,
+            local_rows: 24,
+            mode: Mode::Input,
+            command_target: CommandTarget::Input,
+            ctrl_c_count: 0,
+            message: None,
+            mouse_tracking: false,
+        }
+    }
+
+    fn test_task() -> ExbashTask {
+        ExbashTask {
+            async_id: "rex-1".to_string(),
+            scope: "workspace".to_string(),
+            executor: "remote".to_string(),
+            description: "build firmware".to_string(),
+            command: "make".to_string(),
+            cwd: "/workspace/project".to_string(),
+            state: Some("running".to_string()),
+            exit_code: None,
+            started_at: Some(1),
+        }
+    }
+
     #[test]
     fn status_line_keeps_marker_on_same_row_with_wide_symbols() {
         let line = status_line(
-            "[>] [◆:client-123]  [▶] local:rex-1781162394566-96  long title",
+            "[>] [◆:client-123]  [⠋] local:rex-1781162394566-96  long title",
             "[#]",
             48,
         );
         assert_eq!(UnicodeWidthStr::width(line.as_str()), 48);
         assert!(line.ends_with("[#]"));
+    }
+
+    #[test]
+    fn status_marker_shows_auto_or_blank_control_mode() {
+        assert_eq!(status_marker(true, 80, 24), "[Auto] [80x24]");
+        assert_eq!(status_marker(false, 80, 24), "[    ] [80x24]");
+    }
+
+    #[test]
+    fn status_auto_hit_targets_only_auto_segment() {
+        let cols = 80;
+        let rows = 24;
+        let start =
+            cols as usize - UnicodeWidthStr::width(status_marker(true, cols, rows).as_str());
+        let end = start + UnicodeWidthStr::width(auto_marker(true));
+
+        assert!(!status_auto_hit(true, cols, rows, (start - 1) as u16));
+        assert!(status_auto_hit(true, cols, rows, start as u16));
+        assert!(status_auto_hit(true, cols, rows, (end - 1) as u16));
+        assert!(!status_auto_hit(true, cols, rows, end as u16));
     }
 
     #[test]
@@ -1533,12 +2133,129 @@ mod tests {
     }
 
     #[test]
+    fn attach_status_hides_task_identity_except_link_mode() {
+        let mut view = test_attach_view();
+        let task = test_task();
+        let metrics = Metrics::default();
+
+        let input = attach_status_body(&view, &task, &metrics);
+        assert!(input.contains("build firmware"));
+        assert!(!input.contains("remote:rex-1"));
+
+        view.mode = Mode::Link;
+        let link = attach_status_body(&view, &task, &metrics);
+        assert!(link.contains("remote:rex-1"));
+
+        view.mode = Mode::Command;
+        let command = attach_status_body(&view, &task, &metrics);
+        assert!(command.contains("INPUT"));
+        assert!(!command.contains("remote:rex-1"));
+    }
+
+    #[test]
+    fn list_status_uses_switch_menu_with_selected_task_icon() {
+        let task = test_task();
+
+        assert!(list_status_body(Some(&task)).starts_with("[:]["));
+        assert!(list_status_body(Some(&task)).contains("]SW: INPUT LIST QUIT"));
+        assert_eq!(list_status_body(None), "[:][?]SW: INPUT LIST QUIT");
+    }
+
+    #[test]
+    fn running_icon_cycles_through_geometric_frames() {
+        assert_eq!(running_state_icon(0), "[⠋]");
+        assert_eq!(running_state_icon(1), "[⠙]");
+        assert_eq!(running_state_icon(2), "[⠹]");
+        assert_eq!(running_state_icon(3), "[⠸]");
+        assert_eq!(running_state_icon(4), "[⠼]");
+        assert_eq!(running_state_icon(5), "[⠴]");
+        assert_eq!(running_state_icon(6), "[⠦]");
+        assert_eq!(running_state_icon(7), "[⠧]");
+        assert_eq!(running_state_icon(8), "[⠇]");
+        assert_eq!(running_state_icon(9), "[⠏]");
+        assert_eq!(running_state_icon(10), "[⠋]");
+    }
+
+    #[test]
+    fn mouse_sgr_encodes_button_scroll_and_modifiers() {
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        assert_eq!(mouse_to_sgr_bytes(click).unwrap(), b"\x1b[<16;3;4M");
+
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert_eq!(mouse_to_sgr_bytes(release).unwrap(), b"\x1b[<0;3;4m");
+
+        let scroll = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        assert_eq!(mouse_to_sgr_bytes(scroll).unwrap(), b"\x1b[<69;1;1M");
+    }
+
+    #[test]
+    fn mouse_tracking_updates_from_xterm_private_modes() {
+        let mut view = test_attach_view();
+
+        update_mouse_tracking(&mut view, b"\x1b[?1000;1006h");
+        assert!(view.mouse_tracking);
+
+        update_mouse_tracking(&mut view, b"\x1b[?1000;1006l");
+        assert!(!view.mouse_tracking);
+    }
+
+    #[test]
+    fn status_identity_hit_targets_visible_role_segment() {
+        let view = test_attach_view();
+        let start = UnicodeWidthStr::width("[>] ");
+        let end = start + UnicodeWidthStr::width("[◇:client-123]");
+
+        assert!(!status_identity_hit(&view, (start - 1) as u16));
+        assert!(status_identity_hit(&view, start as u16));
+        assert!(status_identity_hit(&view, (end - 1) as u16));
+        assert!(!status_identity_hit(&view, end as u16));
+    }
+
+    #[test]
+    fn command_menu_hit_test_matches_rendered_targets() {
+        assert_eq!(
+            command_target_at_column(CommandTarget::Input, 4),
+            Some(CommandTarget::Input)
+        );
+        assert_eq!(
+            command_target_at_column(CommandTarget::Input, 10),
+            Some(CommandTarget::Input)
+        );
+        assert_eq!(command_target_at_column(CommandTarget::Input, 11), None);
+        assert_eq!(
+            command_target_at_column(CommandTarget::Input, 13),
+            Some(CommandTarget::List)
+        );
+        assert_eq!(
+            command_target_at_column(CommandTarget::Input, 19),
+            Some(CommandTarget::Quit)
+        );
+        assert_eq!(command_target_at_column(CommandTarget::Input, 3), None);
+    }
+
+    #[test]
     fn command_menu_excludes_task_controls() {
         let text = command_targets_text(CommandTarget::Input);
 
         assert!(!text.contains("STOP"));
         assert!(!text.contains("REMOVE"));
-        assert_eq!(next_command(CommandTarget::List), CommandTarget::Quit);
+        assert!(!text.contains("IDENTITY"));
+        assert_eq!(next_command(CommandTarget::Input), CommandTarget::List);
         assert_eq!(previous_command(CommandTarget::Quit), CommandTarget::List);
     }
 

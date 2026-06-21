@@ -1046,7 +1046,13 @@ pub fn skill() -> McpToolDef {
 pub fn exbash() -> McpToolDef {
     tool_def(
         "exbash",
-        "PTY-backed background terminal. Use `shell` mode first for normal terminal syntax, shell operators, environment expansion, scripts, and configured shell profiles. `run` directly starts a program by splitting `command` into executable + argv, without shell interpretation. If the command finishes within `read_timeout`, the tool returns the output immediately. If it keeps running, the tool returns a detached snapshot with `asyncID`; use `attach`, `list`, `stop`, or `remove` to manage that run later. For `attach`, `read_timeout` is preferred; if only `timeout` is present, it is treated as the read wait capped at 10000 ms. Remote executor tracking is lazy: stored state is updated after successful executor calls. Runs without a description are tracked as `Tmp Running`. Before creating a task, host tracking write/capacity rejection prunes same-scope stopped temporary tasks (`Tmp Running`, plus legacy empty descriptions) once, then rechecks; if still rejected, the original stack-full/write error is returned. For `remove`, missing or lost executor tasks return a warning such as `asyncTaskNotFound` or `notReplayable` and still clear host tracking.",
+        r#"Yeamika REFS-backed PTY terminal for background commands, TUI control, and remote executors.
+1. Default to `shell`: it uses the configured shell profile, shell syntax, environment expansion, and normal program lookup.
+2. Use `run` only when the first token is an explicit executable path or program name; `run` splits `command` into executable + argv and does not use a shell.
+3. For TUI programs, REPLs, or commands that need interactive control, split execution from control: start the process with `shell` or `run`, let it detach in the background, then use `attach` with the returned `asyncID` to interact with the PTY.
+4. `timeout` is the maximum process lifetime for `shell`/`run`; omit it, set `0`, or set `-1` to allow the process to run indefinitely. `read_timeout` is only the wait time for this tool call to collect output; when it expires, the call returns current output or a detached snapshot without stopping the process. For `attach`, `read_timeout` is preferred; if only `timeout` is present, it is treated as the read wait capped at 10000 ms.
+5. Scope defaults to `local`: `local` tasks are visible only in the current session, `workspace` tasks are visible to sessions in the same workspace, and `remote` is only for `mode=list` to read untracked PTY tasks from a remote executor.
+Notes: remote executor tracking is lazy and updates after successful executor calls. Runs without a description are tracked as `Tmp Running`. Before creating a task, host tracking write/capacity rejection prunes same-scope stopped temporary tasks (`Tmp Running`, plus legacy empty descriptions) once, then rechecks. For `remove`, missing or lost executor tasks return a warning such as `asyncTaskNotFound` or `notReplayable` and still clear host tracking."#,
         vec![],
         vec![
             exec_session_prop(),
@@ -1056,7 +1062,7 @@ pub fn exbash() -> McpToolDef {
             prop(
                 "mode",
                 string_enum_default_desc(
-                    "Operation selector. `shell` is the default terminal path. `run` directly starts a program and splits `command` into executable + argv without shell parsing.",
+                    "Operation selector. Default to `shell` for ordinary commands because it uses the configured shell and normal program lookup. Use `run` only when the executable is explicit; `run` splits `command` into executable + argv without shell parsing.",
                     &["run", "shell", "attach", "list", "stop", "remove"],
                     "shell",
                 ),
@@ -1064,7 +1070,7 @@ pub fn exbash() -> McpToolDef {
             prop(
                 "scope",
                 string_enum_default_desc(
-                    "Task tracking view for `list`, `run`, and `shell`. `local` tracks the current session; `workspace` tracks the current workdir; `remote` is only valid with `mode=list`, requires a non-local executor, and queries live remote tasks without changing stored tracking.",
+                    "Task tracking view for `list`, `run`, and `shell`. `local` is the default and is visible only to the current session. `workspace` tracks the current workdir and is visible to sessions in the same workspace. `remote` is only valid with `mode=list`, requires a non-local executor, and reads live untracked PTY tasks without changing stored tracking.",
                     &["local", "workspace", "remote"],
                     "local",
                 ),
@@ -1072,7 +1078,7 @@ pub fn exbash() -> McpToolDef {
             prop(
                 "command",
                 string_prop(
-                    "Command text. In `shell` mode it is sent to the configured shell profile. In `run` mode it is parsed as executable + argv and shell syntax is not interpreted.",
+                    "Command text. In `shell` mode it is sent to the configured shell profile, so shell syntax and normal program lookup work. In `run` mode it is parsed as executable + argv; shell syntax is not interpreted and the first token must be the executable program.",
                 ),
             ),
             prop(
@@ -1083,13 +1089,41 @@ pub fn exbash() -> McpToolDef {
                 ),
             ),
             prop("description", string_prop("Optional display text for the run. The description is shown in run listings and detached snapshots; omitted or blank values are tracked as `Tmp Running`.")),
-            prop("timeout", integer_prop("Total lifetime timeout in milliseconds for `run` and `shell`. Omit, 0, or -1 to leave the run unmanaged. For `attach`, this is accepted as a legacy read wait when `read_timeout` is absent, capped at 10000 ms.")),
-            prop("read_timeout", integer_prop("How long to wait before returning. If the process is still running at timeout, the tool returns a detached snapshot with `asyncID`. For `attach`, this field wins when both `timeout` and `read_timeout` are present.")),
+            prop("timeout", integer_prop("Maximum process lifetime in milliseconds for `run` and `shell`. Omit, 0, or -1 to allow the process to keep running indefinitely. For `attach`, this is accepted only as a legacy read wait when `read_timeout` is absent, capped at 10000 ms.")),
+            prop("read_timeout", integer_prop("How long this tool call waits to collect output before returning. Expiring `read_timeout` does not stop the process; if it is still running, the tool returns current output or a detached snapshot with `asyncID`. For `attach`, this field wins when both `timeout` and `read_timeout` are present.")),
             prop("asyncID", string_prop("Run id returned by detached `run` or `shell`; required for `attach`, `stop`, and `remove`.")),
             prop("text", string_prop("Text to write to PTY stdin in `attach` mode. Interactive programs may require control bytes; escape sequences are decoded before writing, so use `\\n` for Enter/newline and `\\u0003` for Ctrl-C/control bytes.")),
             prop("filePath", string_prop("File path for `attach` mode input. Mutually exclusive with `text`.")),
             prop("workdir", string_prop("Working directory for `run` and `shell` commands.")),
             prop("showRawPretty", boolean_prop("Include raw PTY text in attach metadata.")),
+        ],
+    )
+}
+
+pub fn file_transfer() -> McpToolDef {
+    tool_def(
+        "file_transfer",
+        "Prepare same-port HTTP file transfer request metadata. Use `mode=\"download\"` for targetPath -> localPath, and `mode=\"upload\"` for localPath -> targetPath. `localPath` is the caller/opencode side path and accepts local hashRef/fileRef labels or relative paths resolved from the current session workspace. `targetPath` is the selected executor side path. The file bytes are transferred outside MCP by connecting to the returned URL with the returned method and headers.",
+        vec!["mode", "localPath", "targetPath"],
+        vec![
+            exec_session_prop(),
+            executor_prop(),
+            prop(
+                "mode",
+                string_enum_prop(&["download", "upload"]),
+            ),
+            prop(
+                "localPath",
+                string_prop("Local path on the caller/opencode side. Accepts local hashRef/fileRef labels and relative paths resolved from the current session workspace."),
+            ),
+            prop(
+                "targetPath",
+                string_prop("Path on the selected executor side."),
+            ),
+            prop(
+                "overwrite",
+                boolean_prop("For upload, allow replacing an existing target file."),
+            ),
         ],
     )
 }
@@ -1418,6 +1452,7 @@ pub fn all_tools() -> Vec<McpToolDef> {
         read(),
         rg(),
         skill(),
+        file_transfer(),
         exbash(),
         remote_executor_manager(),
     ]

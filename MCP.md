@@ -10,6 +10,7 @@ It does not start MCP transports. It provides:
   - `FileAction`
   - `read`
   - `rg`
+  - `file_transfer`
   - `exbash`
   - `RemoteExecutorManager`
 

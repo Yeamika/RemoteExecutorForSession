@@ -3,11 +3,13 @@ use futures_util::{SinkExt, StreamExt};
 use remote_executor_for_session::demos::memory_host::MemorySessionHost;
 use remote_executor_for_session::jsonrpc::{JsonRpcEndpoint, JsonRpcHandler};
 use remote_executor_for_session::mcp::create_session_mcp_with_manager;
+use remote_executor_for_session::ptyt::{RefsPtytGateway, RefsPtytRegistration, RefsPtytScheduler};
 use remote_executor_for_session::rec::{new_manager, ShellManager, ToolContext};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -33,6 +35,7 @@ async fn main() -> Result<()> {
     let endpoint = Arc::new(JsonRpcEndpoint::new(create_session_mcp_with_manager(
         ctx, host, shared, shell,
     )));
+    let gateway = Arc::new(RefsPtytGateway::new(endpoint, RefsPtytScheduler::default()));
 
     let listener = TcpListener::bind(&listen)
         .await
@@ -46,9 +49,9 @@ async fn main() -> Result<()> {
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let endpoint = endpoint.clone();
+        let gateway = gateway.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(endpoint, stream).await {
+            if let Err(error) = handle_connection(gateway, stream).await {
                 eprintln!("rec_mcp_memory_ws_server client {peer} error: {error:#}");
             }
         });
@@ -56,55 +59,87 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_connection<H: JsonRpcHandler>(
-    endpoint: Arc<JsonRpcEndpoint<H>>,
+    gateway: Arc<RefsPtytGateway<H>>,
     stream: TcpStream,
 ) -> Result<()> {
     let ws = accept_async(stream).await?;
     let (mut write, mut read) = ws.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let mut registration = None::<RefsPtytRegistration>;
 
-    while let Some(message) = read.next().await {
-        match message? {
-            Message::Text(text) => {
-                let response = match serde_json::from_str::<Value>(&text) {
-                    Ok(input) => handle_message(&endpoint, input).await,
-                    Err(error) => Some(error_response(Value::Null, -32700, error.to_string())),
+    loop {
+        tokio::select! {
+            outbound = rx.recv() => {
+                let Some(outbound) = outbound else {
+                    break;
                 };
-                if let Some(output) = response {
-                    write
-                        .send(Message::Text(serde_json::to_string(&output)?.into()))
-                        .await?;
+                write.send(Message::Text(outbound.into())).await?;
+            }
+            message = read.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                match message? {
+                    Message::Text(text) => {
+                        match gateway.handle_client_text(&text, tx.clone()).await {
+                            Ok(Some(next)) => {
+                                registration = Some(next);
+                            }
+                            Ok(None) => {
+                                let response = match serde_json::from_str::<Value>(&text) {
+                                    Ok(input) => handle_message(&gateway, input).await,
+                                    Err(error) => Some(error_response(Value::Null, -32700, error.to_string())),
+                                };
+                                if let Some(output) = response {
+                                    write
+                                        .send(Message::Text(serde_json::to_string(&output)?.into()))
+                                        .await?;
+                                }
+                            }
+                            Err(error) => {
+                                write
+                                    .send(Message::Text(
+                                        error_response(Value::Null, -32602, error.to_string()).to_string().into(),
+                                    ))
+                                    .await?;
+                            }
+                        }
+                    }
+                    Message::Ping(data) => write.send(Message::Pong(data)).await?,
+                    Message::Close(frame) => {
+                        let _ = write.send(Message::Close(frame)).await;
+                        break;
+                    }
+                    Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
                 }
             }
-            Message::Ping(data) => write.send(Message::Pong(data)).await?,
-            Message::Close(frame) => {
-                let _ = write.send(Message::Close(frame)).await;
-                break;
-            }
-            Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
+    }
+    if let Some(registration) = registration {
+        gateway.unregister(&registration).await;
     }
 
     Ok(())
 }
 
 async fn handle_message<H: JsonRpcHandler>(
-    endpoint: &JsonRpcEndpoint<H>,
+    gateway: &RefsPtytGateway<H>,
     input: Value,
 ) -> Option<Value> {
     if let Some(batch) = input.as_array() {
         let mut responses = Vec::new();
         for item in batch {
-            if let Some(response) = handle_single(endpoint, item.clone()).await {
+            if let Some(response) = handle_single(gateway, item.clone()).await {
                 responses.push(response);
             }
         }
         return (!responses.is_empty()).then_some(Value::Array(responses));
     }
-    handle_single(endpoint, input).await
+    handle_single(gateway, input).await
 }
 
 async fn handle_single<H: JsonRpcHandler>(
-    endpoint: &JsonRpcEndpoint<H>,
+    gateway: &RefsPtytGateway<H>,
     input: Value,
 ) -> Option<Value> {
     let id = input.get("id").cloned()?;
@@ -119,7 +154,7 @@ async fn handle_single<H: JsonRpcHandler>(
             input.get("params").cloned().unwrap_or(Value::Null),
         )),
         "ping" => Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
-        "tools/list" | "tools/call" => Some(endpoint.handle_value(input).await),
+        "tools/list" | "tools/call" => Some(gateway.handle_endpoint_value(input).await),
         _ => Some(error_response(
             id,
             -32601,

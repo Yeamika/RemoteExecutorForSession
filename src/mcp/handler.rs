@@ -64,6 +64,28 @@ struct WorkspaceExecutorConfig {
     executors: Vec<WorkspaceExecutorInfo>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FileTransferPrepareOptions {
+    mode: FileTransferPrepareMode,
+    #[serde(rename = "localPath")]
+    local_path: String,
+    #[serde(rename = "targetPath")]
+    target_path: String,
+    #[serde(default)]
+    executor: Option<String>,
+    #[serde(default, rename = "targetExecutor")]
+    target_executor: Option<String>,
+    #[serde(default)]
+    overwrite: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum FileTransferPrepareMode {
+    Download,
+    Upload,
+}
+
 #[derive(Clone, Debug)]
 struct SkillTarget {
     executor: String,
@@ -283,6 +305,126 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             }],
             structured_content: Some(strip_output(result)),
         })
+    }
+
+    async fn prepare_file_transfer(
+        &self,
+        scope: &CallScope,
+        arguments: Value,
+    ) -> Result<McpCallResult, JsonRpcError> {
+        let options =
+            serde_json::from_value::<FileTransferPrepareOptions>(arguments).map_err(|err| {
+                JsonRpcError::invalid_params(format!("bad file_transfer params: {err}"))
+            })?;
+        let executor = options
+            .executor
+            .or(options.target_executor)
+            .unwrap_or_else(|| "local".to_string());
+        let local_path = self
+            .resolve_local_transfer_path(scope, &options.local_path)
+            .await?;
+        let control_url = self.executor_control_url(scope, &executor).await?;
+        let url = http_file_transfer_url(&control_url)?;
+        let method = match options.mode {
+            FileTransferPrepareMode::Download => "GET",
+            FileTransferPrepareMode::Upload => "PUT",
+        };
+        let mut headers = serde_json::Map::new();
+        headers.insert(
+            "X-RE-Path".to_string(),
+            Value::String(options.target_path.clone()),
+        );
+        if executor == "local" {
+            headers.insert(
+                "X-RE-Directory".to_string(),
+                Value::String(scope.workdir.clone()),
+            );
+        }
+        if let Some(overwrite) = options.overwrite {
+            headers.insert(
+                "X-RE-Overwrite".to_string(),
+                Value::String(overwrite.to_string()),
+            );
+        }
+        let result = json!({
+            "metadata": {
+                "executor": executor,
+                "mode": match method {
+                    "GET" => "download",
+                    _ => "upload",
+                },
+                "localPath": local_path,
+                "targetPath": options.target_path,
+                "method": method,
+                "url": url,
+                "headers": headers,
+            },
+            "output": {
+                "message": "",
+                "text": format_file_transfer_text(method, &url, &Value::Object(headers)),
+                "info": "",
+            }
+        });
+        Ok(McpCallResult {
+            content: vec![McpContentText {
+                kind: "text".to_string(),
+                text: extract_output_text(&result),
+            }],
+            structured_content: Some(strip_output(result)),
+        })
+    }
+
+    async fn resolve_local_transfer_path(
+        &self,
+        scope: &CallScope,
+        local_path: &str,
+    ) -> Result<String, JsonRpcError> {
+        if self.host.is_hash_ref(local_path) {
+            let entry = self
+                .host
+                .resolve_hash_ref(&scope.session_id, local_path)
+                .await
+                .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+            if entry.executor != "local" {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "localPath hashRef must resolve to local executor, got {}",
+                    entry.executor
+                )));
+            }
+            return Ok(entry.file_path);
+        }
+
+        let path = PathBuf::from(local_path);
+        if path.is_absolute() || is_windows_absolute_path(local_path) {
+            return Ok(local_path.to_string());
+        }
+        Ok(PathBuf::from(&scope.workdir)
+            .join(path)
+            .to_string_lossy()
+            .to_string())
+    }
+
+    async fn executor_control_url(
+        &self,
+        scope: &CallScope,
+        executor: &str,
+    ) -> Result<String, JsonRpcError> {
+        if executor == "local" {
+            return self
+                .local_executor_metadata()
+                .await?
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| JsonRpcError::internal("local executor URL is unavailable"));
+        }
+        let config = self.read_workspace_executor_config(scope).await?;
+        config
+            .executors
+            .iter()
+            .find(|item| item.id == executor)
+            .map(|item| item.url.clone())
+            .ok_or_else(|| JsonRpcError::internal(format!("executor not found: {executor}")))
     }
 
     async fn resolve_file_args(
@@ -2275,6 +2417,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                     .await?;
                 remove_field(&mut call_args, "scope");
                 remove_field(&mut call_args, "spoe");
+                remove_field(&mut call_args, "refsPtytResolve");
                 let result = match self.call_executor_tool(&scope, "exbash", call_args).await {
                     Ok(result) => result,
                     Err(error) => {
@@ -2373,6 +2516,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 })
             }
             "skill" => self.call_skill(&scope, arguments).await,
+            "file_transfer" => self.prepare_file_transfer(&scope, arguments).await,
             "rg" => {
                 let mode = extract_rg_mode(&arguments)?;
                 let method = match mode {
@@ -2513,6 +2657,44 @@ fn executor_list_output_text(result: &Value) -> Option<String> {
         lines.push(line);
     }
     Some(lines.join("\n"))
+}
+
+fn http_file_transfer_url(control_url: &str) -> Result<String, JsonRpcError> {
+    if let Some(rest) = control_url.strip_prefix("ws://") {
+        return Ok(format!("http://{rest}/re-file/v1"));
+    }
+    if let Some(rest) = control_url.strip_prefix("wss://") {
+        return Ok(format!("https://{rest}/re-file/v1"));
+    }
+    Err(JsonRpcError::internal(format!(
+        "unsupported executor URL for file transfer: {control_url}"
+    )))
+}
+
+fn format_file_transfer_text(method: &str, url: &str, headers: &Value) -> String {
+    let mut lines = vec![format!("{method} {url}")];
+    if let Some(headers) = headers.as_object() {
+        let mut entries = headers.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| *key);
+        lines.extend(
+            entries
+                .into_iter()
+                .map(|(key, value)| format!("{key}: {}", value.as_str().unwrap_or_default())),
+        );
+    }
+    lines.join("\n")
+}
+
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+        && bytes[0].is_ascii_alphabetic()
+    {
+        return true;
+    }
+    path.starts_with("\\\\")
 }
 
 fn labels_output_text(labels: Option<&Value>) -> Option<String> {

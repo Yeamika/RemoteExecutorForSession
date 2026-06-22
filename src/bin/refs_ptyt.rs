@@ -571,6 +571,15 @@ fn toggle_auto_schedule(
     let _ = control_tx.send(ControlCommand::SetSchedulable(*auto_schedule));
 }
 
+fn toggle_attach_auto_schedule(
+    view: &mut AttachView,
+    auto_schedule: &mut bool,
+    control_tx: &mpsc::UnboundedSender<ControlCommand>,
+) {
+    view.message = None;
+    toggle_auto_schedule(auto_schedule, control_tx);
+}
+
 fn handle_control_message(input: &str, tx: &mpsc::UnboundedSender<LocalEvent>) {
     let Ok(message) = serde_json::from_str::<ControlMessage>(input) else {
         return;
@@ -994,7 +1003,7 @@ async fn process_attach_mouse(
                 mouse.column,
             )
         {
-            toggle_auto_schedule(auto_schedule, control_tx);
+            toggle_attach_auto_schedule(view, auto_schedule, control_tx);
             render_attach(out, parser, view, task, metrics, *auto_schedule)?;
         } else if view.message.is_none()
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -2123,6 +2132,23 @@ mod tests {
         assert!(status_auto_hit(true, cols, rows, start as u16));
         assert!(status_auto_hit(true, cols, rows, (end - 1) as u16));
         assert!(!status_auto_hit(true, cols, rows, end as u16));
+    }
+
+    #[test]
+    fn attach_auto_toggle_clears_status_message() {
+        let mut view = test_attach_view();
+        let mut auto_schedule = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        view.message = Some("assigned here".to_string());
+
+        toggle_attach_auto_schedule(&mut view, &mut auto_schedule, &tx);
+
+        assert!(!auto_schedule);
+        assert_eq!(view.message, None);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ControlCommand::SetSchedulable(false)
+        );
     }
 
     #[test]

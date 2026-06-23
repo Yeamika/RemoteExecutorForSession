@@ -14,15 +14,17 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, RwLock};
+use tokio::task::JoinHandle;
 
 type SharedManager = Arc<Caller>;
+type SharedFileTransferRegistry = Arc<RwLock<FileTransferRegistry>>;
 const TMP_RUNNING_DESCRIPTION: &str = "Tmp Running";
 const FILE_TRANSFER_MAX_HEADER_BYTES: usize = 64 * 1024;
 
@@ -68,25 +70,103 @@ struct WorkspaceExecutorConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct FileTransferPrepareOptions {
-    mode: FileTransferPrepareMode,
-    #[serde(rename = "localPath")]
-    local_path: String,
-    #[serde(rename = "targetPath")]
-    target_path: String,
+struct FileTransferOptions {
+    mode: FileTransferMode,
+    #[serde(default, rename = "localPath")]
+    local_path: Option<String>,
+    #[serde(default, rename = "targetPath")]
+    target_path: Option<String>,
     #[serde(default)]
     executor: Option<String>,
     #[serde(default, rename = "targetExecutor")]
     target_executor: Option<String>,
     #[serde(default)]
     overwrite: Option<bool>,
+    #[serde(default, rename = "transferID", alias = "transferId")]
+    transfer_id: Option<String>,
+    #[serde(default)]
+    timeout: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum FileTransferPrepareMode {
+enum FileTransferMode {
     Download,
     Upload,
+    List,
+    Attach,
+    Remove,
+}
+
+impl FileTransferMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            FileTransferMode::Download => "download",
+            FileTransferMode::Upload => "upload",
+            FileTransferMode::List => "list",
+            FileTransferMode::Attach => "attach",
+            FileTransferMode::Remove => "remove",
+        }
+    }
+}
+
+#[derive(Default)]
+struct FileTransferRegistry {
+    tasks: HashMap<String, FileTransferTaskEntry>,
+    next_id: u64,
+}
+
+struct FileTransferTaskEntry {
+    snapshot: FileTransferTaskSnapshot,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileTransferTaskSnapshot {
+    #[serde(rename = "transferID")]
+    transfer_id: String,
+    session_id: String,
+    workdir: String,
+    executor: String,
+    mode: String,
+    status: String,
+    local_path: String,
+    target_path: String,
+    method: String,
+    url: String,
+    bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+    speed_bps: u64,
+    started_at: i64,
+    updated_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_code: Option<u16>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    response_headers: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl FileTransferTaskSnapshot {
+    fn refresh_speed(&mut self, now: i64) {
+        self.updated_at = now;
+        let elapsed_ms = (now - self.started_at).max(1) as u64;
+        self.speed_bps = self.bytes.saturating_mul(1000) / elapsed_ms;
+    }
+}
+
+#[derive(Clone)]
+struct FileTransferProgress {
+    registry: SharedFileTransferRegistry,
+    transfer_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +192,11 @@ pub async fn create_session_mcp<H: SessionHost + 'static>(
     manager
         .get_or_try_init(|| async { new_manager().await.map(Arc::new) })
         .await?;
-    Ok(EmbeddedMcp::new(SessionMcpHandler { host, manager }))
+    Ok(EmbeddedMcp::new(SessionMcpHandler {
+        host,
+        manager,
+        file_transfers: Arc::new(RwLock::new(FileTransferRegistry::default())),
+    }))
 }
 
 pub fn create_session_mcp_with_manager<H: SessionHost + 'static>(
@@ -126,6 +210,7 @@ pub fn create_session_mcp_with_manager<H: SessionHost + 'static>(
     EmbeddedMcp::new(SessionMcpHandler {
         host,
         manager: cell,
+        file_transfers: Arc::new(RwLock::new(FileTransferRegistry::default())),
     })
 }
 
@@ -139,6 +224,7 @@ pub async fn create_default_session_mcp(
 pub struct SessionMcpHandler<H: SessionHost> {
     host: Arc<H>,
     manager: OnceCell<SharedManager>,
+    file_transfers: SharedFileTransferRegistry,
 }
 
 impl<H: SessionHost + 'static> SessionMcpHandler<H> {
@@ -315,28 +401,50 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         scope: &CallScope,
         arguments: Value,
     ) -> Result<McpCallResult, JsonRpcError> {
-        let options =
-            serde_json::from_value::<FileTransferPrepareOptions>(arguments).map_err(|err| {
-                JsonRpcError::invalid_params(format!("bad file_transfer params: {err}"))
-            })?;
+        let options = serde_json::from_value::<FileTransferOptions>(arguments).map_err(|err| {
+            JsonRpcError::invalid_params(format!("bad file_transfer params: {err}"))
+        })?;
+        match options.mode {
+            FileTransferMode::Download | FileTransferMode::Upload => {
+                self.start_file_transfer(scope, options).await
+            }
+            FileTransferMode::List => self.list_file_transfers(scope, options).await,
+            FileTransferMode::Attach => self.attach_file_transfer(scope, options).await,
+            FileTransferMode::Remove => self.remove_file_transfer(scope, options).await,
+        }
+    }
+
+    async fn start_file_transfer(
+        &self,
+        scope: &CallScope,
+        options: FileTransferOptions,
+    ) -> Result<McpCallResult, JsonRpcError> {
         let executor = options
             .executor
-            .or(options.target_executor)
+            .clone()
+            .or(options.target_executor.clone())
             .unwrap_or_else(|| "local".to_string());
+        let mode = options.mode;
+        let local_path_arg = options
+            .local_path
+            .as_deref()
+            .ok_or_else(|| JsonRpcError::invalid_params("localPath is required"))?;
+        let target_path = options
+            .target_path
+            .clone()
+            .ok_or_else(|| JsonRpcError::invalid_params("targetPath is required"))?;
         let local_path = self
-            .resolve_local_transfer_path(scope, &options.local_path)
+            .resolve_local_transfer_path(scope, local_path_arg)
             .await?;
         let control_url = self.executor_control_url(scope, &executor).await?;
         let url = http_file_transfer_url(&control_url)?;
-        let method = match options.mode {
-            FileTransferPrepareMode::Download => "GET",
-            FileTransferPrepareMode::Upload => "PUT",
+        let method = match mode {
+            FileTransferMode::Download => "GET",
+            FileTransferMode::Upload => "PUT",
+            _ => unreachable!(),
         };
         let mut headers = serde_json::Map::new();
-        headers.insert(
-            "X-RE-Path".to_string(),
-            Value::String(options.target_path.clone()),
-        );
+        headers.insert("X-RE-Path".to_string(), Value::String(target_path.clone()));
         if executor == "local" {
             headers.insert(
                 "X-RE-Directory".to_string(),
@@ -349,43 +457,147 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
                 Value::String(overwrite.to_string()),
             );
         }
-        let outcome = match options.mode {
-            FileTransferPrepareMode::Download => {
+
+        let total_bytes = match mode {
+            FileTransferMode::Download => {
+                prepare_download_local_path(&local_path, options.overwrite.unwrap_or(false))
+                    .await?;
                 headers.insert("X-RE-Hash".to_string(), Value::String("true".to_string()));
-                download_file_transfer(
-                    &url,
-                    &headers,
-                    &local_path,
-                    options.overwrite.unwrap_or(false),
-                    &options.target_path,
-                )
-                .await?
+                None
             }
-            FileTransferPrepareMode::Upload => {
-                upload_file_transfer(&url, &headers, &local_path, &options.target_path).await?
-            }
+            FileTransferMode::Upload => Some(
+                tokio::fs::metadata(&local_path)
+                    .await
+                    .map_err(io_json_error)?
+                    .len(),
+            ),
+            _ => None,
         };
+
+        let started_at = now_ms();
+        let transfer_id = {
+            let mut registry = self.file_transfers.write().await;
+            let session_count = registry
+                .tasks
+                .values()
+                .filter(|entry| entry.snapshot.session_id == scope.session_id)
+                .count();
+            if session_count >= 5 {
+                return Err(JsonRpcError::invalid_params(
+                    "file transfer task stack is full for this session; remove a task first",
+                ));
+            }
+            registry.next_id = registry.next_id.saturating_add(1);
+            let transfer_id = format!("rft-{}-{}", started_at, registry.next_id);
+            registry.tasks.insert(
+                transfer_id.clone(),
+                FileTransferTaskEntry {
+                    snapshot: FileTransferTaskSnapshot {
+                        transfer_id: transfer_id.clone(),
+                        session_id: scope.session_id.clone(),
+                        workdir: scope.workdir.clone(),
+                        executor: executor.clone(),
+                        mode: mode.as_str().to_string(),
+                        status: "running".to_string(),
+                        local_path: local_path.clone(),
+                        target_path: target_path.clone(),
+                        method: method.to_string(),
+                        url: url.clone(),
+                        bytes: 0,
+                        total_bytes,
+                        speed_bps: 0,
+                        started_at,
+                        updated_at: started_at,
+                        ended_at: None,
+                        status_code: None,
+                        response_headers: BTreeMap::new(),
+                        sha256: None,
+                        file: None,
+                        error: None,
+                    },
+                    handle: None,
+                },
+            );
+            transfer_id
+        };
+
+        let registry = self.file_transfers.clone();
+        let progress = FileTransferProgress {
+            registry: registry.clone(),
+            transfer_id: transfer_id.clone(),
+        };
+        let worker_url = url.clone();
+        let worker_headers = headers.clone();
+        let worker_local_path = local_path.clone();
+        let overwrite = options.overwrite.unwrap_or(false);
+        let handle = tokio::spawn(async move {
+            let result = match mode {
+                FileTransferMode::Download => {
+                    download_file_transfer(
+                        &worker_url,
+                        &worker_headers,
+                        &worker_local_path,
+                        overwrite,
+                        progress.clone(),
+                    )
+                    .await
+                }
+                FileTransferMode::Upload => {
+                    upload_file_transfer(
+                        &worker_url,
+                        &worker_headers,
+                        &worker_local_path,
+                        progress.clone(),
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            };
+            match result {
+                Ok(outcome) => progress.finish_success(outcome).await,
+                Err(err) => progress.finish_error(err.message).await,
+            }
+        });
+        let mut maybe_handle = Some(handle);
+        {
+            let mut registry = self.file_transfers.write().await;
+            if let Some(entry) = registry.tasks.get_mut(&transfer_id) {
+                entry.handle = maybe_handle.take();
+            }
+        }
+        if let Some(handle) = maybe_handle {
+            handle.abort();
+        }
+
+        let timeout_ms = options.timeout.unwrap_or(20_000);
+        let snapshot = self
+            .wait_file_transfer(scope, &transfer_id, timeout_ms)
+            .await?;
+        let detached = snapshot.status == "running";
+        Ok(file_transfer_call_result(
+            snapshot,
+            Some(headers),
+            detached,
+            timeout_ms,
+        ))
+    }
+
+    async fn list_file_transfers(
+        &self,
+        scope: &CallScope,
+        options: FileTransferOptions,
+    ) -> Result<McpCallResult, JsonRpcError> {
+        let tasks = self
+            .file_transfer_snapshots(scope, options.transfer_id.as_deref())
+            .await;
         let result = json!({
             "metadata": {
-                "executor": executor,
-                "mode": match method {
-                    "GET" => "download",
-                    _ => "upload",
-                },
-                "localPath": local_path,
-                "targetPath": options.target_path,
-                "method": method,
-                "url": url,
-                "headers": headers,
-                "status": outcome.status,
-                "bytes": outcome.bytes,
-                "responseHeaders": outcome.headers,
-                "sha256": outcome.sha256,
-                "file": outcome.file,
+                "mode": "list",
+                "tasks": tasks,
             },
             "output": {
                 "message": "",
-                "text": outcome.message,
+                "text": format_file_transfer_list(&tasks),
                 "info": "",
             }
         });
@@ -396,6 +608,128 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             }],
             structured_content: Some(strip_output(result)),
         })
+    }
+
+    async fn attach_file_transfer(
+        &self,
+        scope: &CallScope,
+        options: FileTransferOptions,
+    ) -> Result<McpCallResult, JsonRpcError> {
+        let transfer_id = required_transfer_id(&options)?;
+        let timeout_ms = options.timeout.unwrap_or(20_000);
+        let snapshot = self
+            .wait_file_transfer(scope, transfer_id, timeout_ms)
+            .await?;
+        Ok(file_transfer_call_result(snapshot, None, false, timeout_ms))
+    }
+
+    async fn remove_file_transfer(
+        &self,
+        scope: &CallScope,
+        options: FileTransferOptions,
+    ) -> Result<McpCallResult, JsonRpcError> {
+        let transfer_id = required_transfer_id(&options)?;
+        let removed = {
+            let mut registry = self.file_transfers.write().await;
+            let should_remove = registry
+                .tasks
+                .get(transfer_id)
+                .map(|entry| entry.snapshot.session_id == scope.session_id)
+                .unwrap_or(false);
+            if should_remove {
+                registry.tasks.remove(transfer_id)
+            } else {
+                None
+            }
+        }
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("file transfer not found: {transfer_id}"))
+        })?;
+        if let Some(handle) = removed.handle {
+            handle.abort();
+        }
+        let snapshot = removed.snapshot;
+        let result = json!({
+            "metadata": {
+                "mode": "remove",
+                "transferID": transfer_id,
+                "removed": true,
+                "task": snapshot,
+            },
+            "output": {
+                "message": "",
+                "text": format!("Stopped and removed file transfer {transfer_id}"),
+                "info": "",
+            }
+        });
+        Ok(McpCallResult {
+            content: vec![McpContentText {
+                kind: "text".to_string(),
+                text: extract_output_text(&result),
+            }],
+            structured_content: Some(strip_output(result)),
+        })
+    }
+
+    async fn wait_file_transfer(
+        &self,
+        scope: &CallScope,
+        transfer_id: &str,
+        timeout_ms: u64,
+    ) -> Result<FileTransferTaskSnapshot, JsonRpcError> {
+        let started = tokio::time::Instant::now();
+        loop {
+            let snapshot = self.file_transfer_snapshot(scope, transfer_id).await?;
+            if snapshot.status != "running" {
+                return Ok(snapshot);
+            }
+            if timeout_ms == 0 || started.elapsed().as_millis() >= u128::from(timeout_ms) {
+                return Ok(snapshot);
+            }
+            let remaining = u128::from(timeout_ms).saturating_sub(started.elapsed().as_millis());
+            let wait_ms = remaining.min(50) as u64;
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
+    }
+
+    async fn file_transfer_snapshot(
+        &self,
+        scope: &CallScope,
+        transfer_id: &str,
+    ) -> Result<FileTransferTaskSnapshot, JsonRpcError> {
+        self.file_transfers
+            .read()
+            .await
+            .tasks
+            .get(transfer_id)
+            .filter(|entry| entry.snapshot.session_id == scope.session_id)
+            .map(|entry| entry.snapshot.clone())
+            .ok_or_else(|| {
+                JsonRpcError::invalid_params(format!("file transfer not found: {transfer_id}"))
+            })
+    }
+
+    async fn file_transfer_snapshots(
+        &self,
+        scope: &CallScope,
+        transfer_id: Option<&str>,
+    ) -> Vec<FileTransferTaskSnapshot> {
+        let mut tasks = self
+            .file_transfers
+            .read()
+            .await
+            .tasks
+            .values()
+            .filter(|entry| entry.snapshot.session_id == scope.session_id)
+            .filter(|entry| {
+                transfer_id
+                    .map(|transfer_id| entry.snapshot.transfer_id == transfer_id)
+                    .unwrap_or(true)
+            })
+            .map(|entry| entry.snapshot.clone())
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| task.started_at);
+        tasks
     }
 
     async fn resolve_local_transfer_path(
@@ -2683,6 +3017,233 @@ fn executor_list_output_text(result: &Value) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+fn required_transfer_id(options: &FileTransferOptions) -> Result<&str, JsonRpcError> {
+    options
+        .transfer_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| JsonRpcError::invalid_params("transferID is required"))
+}
+
+fn file_transfer_call_result(
+    snapshot: FileTransferTaskSnapshot,
+    headers: Option<serde_json::Map<String, Value>>,
+    detached: bool,
+    timeout_ms: u64,
+) -> McpCallResult {
+    let mut metadata = serde_json::to_value(&snapshot)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    metadata.insert("detached".to_string(), Value::Bool(detached));
+    metadata.insert("timeoutMs".to_string(), json!(timeout_ms));
+    if let Some(headers) = headers {
+        metadata.insert("headers".to_string(), Value::Object(headers));
+    }
+    metadata.insert("status".to_string(), Value::String(snapshot.status.clone()));
+    metadata.insert("bytes".to_string(), json!(snapshot.bytes));
+    metadata.insert(
+        "executor".to_string(),
+        Value::String(snapshot.executor.clone()),
+    );
+    metadata.insert("mode".to_string(), Value::String(snapshot.mode.clone()));
+    metadata.insert(
+        "localPath".to_string(),
+        Value::String(snapshot.local_path.clone()),
+    );
+    metadata.insert(
+        "targetPath".to_string(),
+        Value::String(snapshot.target_path.clone()),
+    );
+    metadata.insert("method".to_string(), Value::String(snapshot.method.clone()));
+    metadata.insert("url".to_string(), Value::String(snapshot.url.clone()));
+    metadata.insert(
+        "responseHeaders".to_string(),
+        serde_json::to_value(&snapshot.response_headers).unwrap_or_default(),
+    );
+    let result = json!({
+        "metadata": metadata,
+        "output": {
+            "message": "",
+            "text": format_file_transfer_snapshot(&snapshot, detached),
+            "info": "",
+        }
+    });
+    McpCallResult {
+        content: vec![McpContentText {
+            kind: "text".to_string(),
+            text: extract_output_text(&result),
+        }],
+        structured_content: Some(strip_output(result)),
+    }
+}
+
+fn format_file_transfer_snapshot(snapshot: &FileTransferTaskSnapshot, detached: bool) -> String {
+    match snapshot.status.as_str() {
+        "completed" => match snapshot.mode.as_str() {
+            "download" => format!(
+                "Downloaded {} bytes: {} -> {}",
+                snapshot.bytes, snapshot.target_path, snapshot.local_path
+            ),
+            "upload" => format!(
+                "Uploaded {} bytes: {} -> {}",
+                snapshot.bytes, snapshot.local_path, snapshot.target_path
+            ),
+            _ => format!(
+                "File transfer {} completed: {} bytes",
+                snapshot.transfer_id, snapshot.bytes
+            ),
+        },
+        "failed" => format!(
+            "File transfer {} failed: {}",
+            snapshot.transfer_id,
+            snapshot.error.as_deref().unwrap_or("unknown error")
+        ),
+        _ if detached => format!(
+            "Detached file transfer {}: {}",
+            snapshot.transfer_id,
+            format_file_transfer_progress(snapshot)
+        ),
+        _ => format!(
+            "File transfer {} is running: {}",
+            snapshot.transfer_id,
+            format_file_transfer_progress(snapshot)
+        ),
+    }
+}
+
+fn format_file_transfer_list(tasks: &[FileTransferTaskSnapshot]) -> String {
+    let mut lines = vec!["file transfers:".to_string()];
+    if tasks.is_empty() {
+        lines.push("- none".to_string());
+    }
+    for task in tasks {
+        lines.push(format!(
+            "- {} {} {} {}",
+            task.transfer_id,
+            task.status,
+            task.mode,
+            format_file_transfer_progress(task)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_file_transfer_progress(snapshot: &FileTransferTaskSnapshot) -> String {
+    let total = snapshot
+        .total_bytes
+        .map(|total| format!("/{total}"))
+        .unwrap_or_default();
+    let (from, to) = if snapshot.mode == "download" {
+        (&snapshot.target_path, &snapshot.local_path)
+    } else {
+        (&snapshot.local_path, &snapshot.target_path)
+    };
+    format!(
+        "{} -> {} bytes={}{total} speed={}/s",
+        from,
+        to,
+        snapshot.bytes,
+        format_bytes(snapshot.speed_bps)
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = UNITS[0];
+    for next in UNITS.iter().skip(1) {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    if unit == "B" {
+        format!("{bytes} {unit}")
+    } else {
+        format!("{value:.1} {unit}")
+    }
+}
+
+async fn prepare_download_local_path(
+    local_path: &str,
+    overwrite: bool,
+) -> Result<(), JsonRpcError> {
+    let local = PathBuf::from(local_path);
+    if tokio::fs::try_exists(&local).await.map_err(io_json_error)? && !overwrite {
+        return Err(JsonRpcError::invalid_params(format!(
+            "localPath already exists; pass overwrite=true to replace: {}",
+            local.display()
+        )));
+    }
+    if let Some(parent) = local
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(io_json_error)?;
+    }
+    Ok(())
+}
+
+impl FileTransferProgress {
+    async fn add_bytes(&self, bytes: u64) {
+        let mut registry = self.registry.write().await;
+        if let Some(entry) = registry.tasks.get_mut(&self.transfer_id) {
+            entry.snapshot.bytes = entry.snapshot.bytes.saturating_add(bytes);
+            entry.snapshot.refresh_speed(now_ms());
+        }
+    }
+
+    async fn set_response(&self, status: u16, headers: &BTreeMap<String, String>) {
+        let mut registry = self.registry.write().await;
+        if let Some(entry) = registry.tasks.get_mut(&self.transfer_id) {
+            entry.snapshot.status_code = Some(status);
+            entry.snapshot.response_headers = headers.clone();
+            if let Some(total) = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                entry.snapshot.total_bytes = Some(total);
+            }
+            entry.snapshot.refresh_speed(now_ms());
+        }
+    }
+
+    async fn finish_success(&self, outcome: FileTransferOutcome) {
+        let mut registry = self.registry.write().await;
+        if let Some(entry) = registry.tasks.get_mut(&self.transfer_id) {
+            let now = now_ms();
+            entry.snapshot.status = "completed".to_string();
+            entry.snapshot.bytes = outcome.bytes;
+            entry.snapshot.total_bytes = entry.snapshot.total_bytes.or(Some(outcome.bytes));
+            entry.snapshot.status_code = Some(outcome.status);
+            entry.snapshot.response_headers = outcome.headers;
+            entry.snapshot.sha256 = outcome.sha256;
+            entry.snapshot.file = outcome.file;
+            entry.snapshot.error = None;
+            entry.snapshot.ended_at = Some(now);
+            entry.snapshot.refresh_speed(now);
+            entry.handle = None;
+        }
+    }
+
+    async fn finish_error(&self, error: String) {
+        let mut registry = self.registry.write().await;
+        if let Some(entry) = registry.tasks.get_mut(&self.transfer_id) {
+            let now = now_ms();
+            entry.snapshot.status = "failed".to_string();
+            entry.snapshot.error = Some(error);
+            entry.snapshot.ended_at = Some(now);
+            entry.snapshot.refresh_speed(now);
+            entry.handle = None;
+        }
+    }
+}
+
 fn http_file_transfer_url(control_url: &str) -> Result<String, JsonRpcError> {
     if let Some(rest) = control_url.strip_prefix("ws://") {
         return Ok(format!("http://{rest}/re-file/v1"));
@@ -2716,7 +3277,6 @@ struct FileTransferOutcome {
     headers: BTreeMap<String, String>,
     sha256: Option<String>,
     file: Option<Value>,
-    message: String,
 }
 
 async fn download_file_transfer(
@@ -2724,24 +3284,11 @@ async fn download_file_transfer(
     headers: &serde_json::Map<String, Value>,
     local_path: &str,
     overwrite: bool,
-    target_path: &str,
+    progress: FileTransferProgress,
 ) -> Result<FileTransferOutcome, JsonRpcError> {
     let endpoint = parse_file_transfer_url(url)?;
     let local = PathBuf::from(local_path);
-    if tokio::fs::try_exists(&local).await.map_err(io_json_error)? && !overwrite {
-        return Err(JsonRpcError::invalid_params(format!(
-            "localPath already exists; pass overwrite=true to replace: {}",
-            local.display()
-        )));
-    }
-    if let Some(parent) = local
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(io_json_error)?;
-    }
+    prepare_download_local_path(local_path, overwrite).await?;
 
     let temp_path = local_download_temp_path(&local);
     let mut stream = TcpStream::connect(&endpoint.addr)
@@ -2749,6 +3296,9 @@ async fn download_file_transfer(
         .map_err(io_json_error)?;
     write_file_transfer_request_head(&mut stream, "GET", &endpoint, headers, None).await?;
     let response = read_file_transfer_response(&mut stream).await?;
+    progress
+        .set_response(response.status, &response.headers)
+        .await;
     if response.status != 200 {
         let body = read_remaining_body(&mut stream, response.body_start)
             .await
@@ -2765,6 +3315,7 @@ async fn download_file_transfer(
             .await
             .map_err(io_json_error)?;
         bytes += response.body_start.len() as u64;
+        progress.add_bytes(response.body_start.len() as u64).await;
     }
     let mut buf = [0u8; 1024 * 64];
     loop {
@@ -2774,6 +3325,7 @@ async fn download_file_transfer(
         }
         file.write_all(&buf[..read]).await.map_err(io_json_error)?;
         bytes += read as u64;
+        progress.add_bytes(read as u64).await;
     }
     file.flush().await.map_err(io_json_error)?;
     drop(file);
@@ -2793,10 +3345,6 @@ async fn download_file_transfer(
         headers: response.headers,
         sha256,
         file: None,
-        message: format!(
-            "Downloaded {bytes} bytes: {target_path} -> {}",
-            local.display()
-        ),
     })
 }
 
@@ -2804,7 +3352,7 @@ async fn upload_file_transfer(
     url: &str,
     headers: &serde_json::Map<String, Value>,
     local_path: &str,
-    target_path: &str,
+    progress: FileTransferProgress,
 ) -> Result<FileTransferOutcome, JsonRpcError> {
     let endpoint = parse_file_transfer_url(url)?;
     let local = PathBuf::from(local_path);
@@ -2826,10 +3374,14 @@ async fn upload_file_transfer(
             .await
             .map_err(io_json_error)?;
         sent += read as u64;
+        progress.add_bytes(read as u64).await;
     }
     stream.flush().await.map_err(io_json_error)?;
 
     let response = read_file_transfer_response(&mut stream).await?;
+    progress
+        .set_response(response.status, &response.headers)
+        .await;
     let body = read_remaining_body(&mut stream, response.body_start)
         .await
         .map_err(io_json_error)?;
@@ -2857,10 +3409,6 @@ async fn upload_file_transfer(
         headers: response.headers,
         sha256,
         file,
-        message: format!(
-            "Uploaded {bytes} bytes: {} -> {target_path}",
-            local.display()
-        ),
     })
 }
 

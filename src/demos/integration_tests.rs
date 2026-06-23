@@ -2406,6 +2406,9 @@ async fn file_transfer_tool_downloads_through_refs() {
     );
     let structured = meta(&prepared);
     assert_eq!(structured["metadata"]["mode"], json!("download"));
+    assert_eq!(structured["metadata"]["status"], json!("completed"));
+    assert_eq!(structured["metadata"]["detached"], json!(false));
+    assert!(structured["metadata"]["transferID"].as_str().is_some());
     assert_eq!(structured["metadata"]["method"], json!("GET"));
     assert_eq!(
         structured["metadata"]["headers"]["X-RE-Path"],
@@ -2487,6 +2490,9 @@ async fn file_transfer_local_path_accepts_local_hash_ref() {
     );
     let structured = meta(&prepared);
     assert_eq!(structured["metadata"]["mode"], json!("upload"));
+    assert_eq!(structured["metadata"]["status"], json!("completed"));
+    assert_eq!(structured["metadata"]["detached"], json!(false));
+    assert!(structured["metadata"]["transferID"].as_str().is_some());
     assert_eq!(structured["metadata"]["method"], json!("PUT"));
     assert_eq!(
         structured["metadata"]["localPath"],
@@ -2505,6 +2511,139 @@ async fn file_transfer_local_path_accepts_local_hash_ref() {
         b"transfer source\n"
     );
     assert!(text(&prepared).contains("Uploaded 16 bytes"));
+}
+
+#[tokio::test]
+async fn file_transfer_tasks_list_attach_remove_and_limit_per_session() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("source.bin"), b"task transfer\n").unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_file_transfer_tasks",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host,
+        shared_manager,
+        shell_manager,
+    ));
+
+    let mut transfer_ids = Vec::new();
+    for idx in 0..5 {
+        let started = call_structured(
+            &ep,
+            "ses_file_transfer_tasks",
+            "file_transfer",
+            json!({
+                "mode":"download",
+                "localPath": format!("./downloaded-{idx}.bin"),
+                "targetPath":"source.bin",
+                "executor":"local",
+                "timeout":0
+            }),
+        )
+        .await;
+        assert!(
+            started["error"].is_null(),
+            "file_transfer start failed: {started:?}"
+        );
+        let transfer_id = meta(&started)["metadata"]["transferID"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        transfer_ids.push(transfer_id);
+    }
+
+    let list = call_structured(
+        &ep,
+        "ses_file_transfer_tasks",
+        "file_transfer",
+        json!({"mode":"list"}),
+    )
+    .await;
+    assert!(list["error"].is_null(), "list failed: {list:?}");
+    assert_eq!(
+        meta(&list)["metadata"]["tasks"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        5
+    );
+    assert!(text(&list).contains(&transfer_ids[0]));
+
+    let attached = call_structured(
+        &ep,
+        "ses_file_transfer_tasks",
+        "file_transfer",
+        json!({
+            "mode":"attach",
+            "transferID": transfer_ids[0],
+            "timeout":5000
+        }),
+    )
+    .await;
+    assert!(attached["error"].is_null(), "attach failed: {attached:?}");
+    assert_eq!(meta(&attached)["metadata"]["status"], json!("completed"));
+    assert_eq!(
+        std::fs::read(dir.path().join("downloaded-0.bin")).unwrap(),
+        b"task transfer\n"
+    );
+
+    let rejected = call_structured(
+        &ep,
+        "ses_file_transfer_tasks",
+        "file_transfer",
+        json!({
+            "mode":"download",
+            "localPath":"./downloaded-overflow.bin",
+            "targetPath":"source.bin",
+            "executor":"local",
+            "timeout":0
+        }),
+    )
+    .await;
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("file transfer task stack is full"),
+        "sixth transfer should be rejected: {rejected:?}"
+    );
+
+    let removed = call_structured(
+        &ep,
+        "ses_file_transfer_tasks",
+        "file_transfer",
+        json!({
+            "mode":"remove",
+            "transferID": transfer_ids[0]
+        }),
+    )
+    .await;
+    assert!(removed["error"].is_null(), "remove failed: {removed:?}");
+    assert_eq!(meta(&removed)["metadata"]["removed"], json!(true));
+
+    let after_remove = call_structured(
+        &ep,
+        "ses_file_transfer_tasks",
+        "file_transfer",
+        json!({
+            "mode":"download",
+            "localPath":"./downloaded-after-remove.bin",
+            "targetPath":"source.bin",
+            "executor":"local",
+            "timeout":0
+        }),
+    )
+    .await;
+    assert!(
+        after_remove["error"].is_null(),
+        "remove should free one transfer slot: {after_remove:?}"
+    );
 }
 
 #[tokio::test]

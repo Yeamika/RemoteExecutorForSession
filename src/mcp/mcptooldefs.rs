@@ -1103,26 +1103,34 @@ Notes: remote executor tracking is lazy and updates after successful executor ca
 pub fn file_transfer() -> McpToolDef {
     tool_def(
         "file_transfer",
-        "Transfer file bytes through REFS using the selected RemoteExecutor's same-port HTTP file transfer endpoint. Use `mode=\"download\"` for targetPath -> localPath, and `mode=\"upload\"` for localPath -> targetPath. `localPath` is the caller/opencode side path and accepts local hashRef/fileRef labels or relative paths resolved from the current session workspace. `targetPath` is the selected executor side path. REFS performs the transfer and returns success/failure metadata; the agent does not need to download/upload manually.",
-        vec!["mode", "localPath", "targetPath"],
+        "Transfer file bytes through REFS using the selected RemoteExecutor's same-port HTTP file transfer endpoint. `download` copies targetPath -> localPath; `upload` copies localPath -> targetPath. Transfers are in-memory and session-scoped inside the current REFS process. `download` and `upload` start a transfer task, wait up to `timeout` milliseconds (default 20000), and return completed metadata if done or a detached `transferID` if still running. Use `list` to see session transfer progress and speed, `attach` with `transferID` to wait again, and `remove` with `transferID` to abort if running and remove the task. Each session keeps at most 5 transfer tasks until removed. `localPath` is the caller/opencode side path and accepts local hashRef/fileRef labels or relative paths resolved from the current session workspace. `targetPath` is the selected executor side path.",
+        vec!["mode"],
         vec![
             exec_session_prop(),
             executor_prop(),
             prop(
                 "mode",
-                string_enum_prop(&["download", "upload"]),
+                string_enum_prop(&["download", "upload", "list", "attach", "remove"]),
             ),
             prop(
                 "localPath",
-                string_prop("Local path on the caller/opencode side. Accepts local hashRef/fileRef labels and relative paths resolved from the current session workspace."),
+                string_prop("Local path on the caller/opencode side. Required for download/upload. Accepts local hashRef/fileRef labels and relative paths resolved from the current session workspace."),
             ),
             prop(
                 "targetPath",
-                string_prop("Path on the selected executor side."),
+                string_prop("Path on the selected executor side. Required for download/upload."),
             ),
             prop(
                 "overwrite",
-                boolean_prop("For upload, allow replacing an existing target file."),
+                boolean_prop("Allow replacing the destination file for download/upload."),
+            ),
+            prop(
+                "transferID",
+                string_prop("Transfer id returned by detached download/upload; used by attach/remove and optional for list filtering."),
+            ),
+            prop(
+                "timeout",
+                integer_prop("How long download/upload/attach waits for completion in milliseconds before returning. Defaults to 20000. Use 0 to return immediately after creating the task."),
             ),
         ],
     )

@@ -15,13 +15,16 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::OnceCell;
 
 type SharedManager = Arc<Caller>;
 const TMP_RUNNING_DESCRIPTION: &str = "Tmp Running";
+const FILE_TRANSFER_MAX_HEADER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 struct CallScope {
@@ -79,7 +82,7 @@ struct FileTransferPrepareOptions {
     overwrite: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum FileTransferPrepareMode {
     Download,
@@ -280,18 +283,18 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
             "connect_to_executor" => {
                 let mut config = self.read_workspace_executor_config(scope).await?;
                 let item = workspace_executor_from_arguments(&arguments)?;
-                upsert_workspace_executor(&mut config, item.clone());
-                self.write_workspace_executor_config(scope, &config).await?;
                 self.manager()?
                     .connect_to_executor(ConnectExecutorOptions {
-                        id: item.id,
-                        url: item.url,
-                        system: item.system,
-                        device: item.device,
-                        labels: item.labels,
+                        id: item.id.clone(),
+                        url: item.url.clone(),
+                        system: item.system.clone(),
+                        device: item.device.clone(),
+                        labels: item.labels.clone(),
                     })
                     .await
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?;
+                upsert_workspace_executor(&mut config, item);
+                self.write_workspace_executor_config(scope, &config).await?;
                 let local = self.local_executor_metadata().await?;
                 workspace_executor_result(&config, local)
             }
@@ -307,7 +310,7 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
         })
     }
 
-    async fn prepare_file_transfer(
+    async fn call_file_transfer(
         &self,
         scope: &CallScope,
         arguments: Value,
@@ -346,6 +349,22 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
                 Value::String(overwrite.to_string()),
             );
         }
+        let outcome = match options.mode {
+            FileTransferPrepareMode::Download => {
+                headers.insert("X-RE-Hash".to_string(), Value::String("true".to_string()));
+                download_file_transfer(
+                    &url,
+                    &headers,
+                    &local_path,
+                    options.overwrite.unwrap_or(false),
+                    &options.target_path,
+                )
+                .await?
+            }
+            FileTransferPrepareMode::Upload => {
+                upload_file_transfer(&url, &headers, &local_path, &options.target_path).await?
+            }
+        };
         let result = json!({
             "metadata": {
                 "executor": executor,
@@ -358,10 +377,15 @@ impl<H: SessionHost + 'static> SessionMcpHandler<H> {
                 "method": method,
                 "url": url,
                 "headers": headers,
+                "status": outcome.status,
+                "bytes": outcome.bytes,
+                "responseHeaders": outcome.headers,
+                "sha256": outcome.sha256,
+                "file": outcome.file,
             },
             "output": {
                 "message": "",
-                "text": format_file_transfer_text(method, &url, &Value::Object(headers)),
+                "text": outcome.message,
                 "info": "",
             }
         });
@@ -2516,7 +2540,7 @@ impl<H: SessionHost + 'static> McpToolHandler for SessionMcpHandler<H> {
                 })
             }
             "skill" => self.call_skill(&scope, arguments).await,
-            "file_transfer" => self.prepare_file_transfer(&scope, arguments).await,
+            "file_transfer" => self.call_file_transfer(&scope, arguments).await,
             "rg" => {
                 let mode = extract_rg_mode(&arguments)?;
                 let method = match mode {
@@ -2671,18 +2695,343 @@ fn http_file_transfer_url(control_url: &str) -> Result<String, JsonRpcError> {
     )))
 }
 
-fn format_file_transfer_text(method: &str, url: &str, headers: &Value) -> String {
-    let mut lines = vec![format!("{method} {url}")];
-    if let Some(headers) = headers.as_object() {
-        let mut entries = headers.iter().collect::<Vec<_>>();
-        entries.sort_by_key(|(key, _)| *key);
-        lines.extend(
-            entries
-                .into_iter()
-                .map(|(key, value)| format!("{key}: {}", value.as_str().unwrap_or_default())),
-        );
+#[derive(Debug)]
+struct FileTransferEndpoint {
+    host: String,
+    addr: String,
+    path: String,
+}
+
+#[derive(Debug)]
+struct FileTransferHttpResponse {
+    status: u16,
+    headers: BTreeMap<String, String>,
+    body_start: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct FileTransferOutcome {
+    status: u16,
+    bytes: u64,
+    headers: BTreeMap<String, String>,
+    sha256: Option<String>,
+    file: Option<Value>,
+    message: String,
+}
+
+async fn download_file_transfer(
+    url: &str,
+    headers: &serde_json::Map<String, Value>,
+    local_path: &str,
+    overwrite: bool,
+    target_path: &str,
+) -> Result<FileTransferOutcome, JsonRpcError> {
+    let endpoint = parse_file_transfer_url(url)?;
+    let local = PathBuf::from(local_path);
+    if tokio::fs::try_exists(&local).await.map_err(io_json_error)? && !overwrite {
+        return Err(JsonRpcError::invalid_params(format!(
+            "localPath already exists; pass overwrite=true to replace: {}",
+            local.display()
+        )));
     }
-    lines.join("\n")
+    if let Some(parent) = local
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(io_json_error)?;
+    }
+
+    let temp_path = local_download_temp_path(&local);
+    let mut stream = TcpStream::connect(&endpoint.addr)
+        .await
+        .map_err(io_json_error)?;
+    write_file_transfer_request_head(&mut stream, "GET", &endpoint, headers, None).await?;
+    let response = read_file_transfer_response(&mut stream).await?;
+    if response.status != 200 {
+        let body = read_remaining_body(&mut stream, response.body_start)
+            .await
+            .map_err(io_json_error)?;
+        return Err(file_transfer_status_error(response.status, body));
+    }
+
+    let mut file = tokio::fs::File::create(&temp_path)
+        .await
+        .map_err(io_json_error)?;
+    let mut bytes = 0u64;
+    if !response.body_start.is_empty() {
+        file.write_all(&response.body_start)
+            .await
+            .map_err(io_json_error)?;
+        bytes += response.body_start.len() as u64;
+    }
+    let mut buf = [0u8; 1024 * 64];
+    loop {
+        let read = stream.read(&mut buf).await.map_err(io_json_error)?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buf[..read]).await.map_err(io_json_error)?;
+        bytes += read as u64;
+    }
+    file.flush().await.map_err(io_json_error)?;
+    drop(file);
+    if overwrite && tokio::fs::try_exists(&local).await.map_err(io_json_error)? {
+        tokio::fs::remove_file(&local)
+            .await
+            .map_err(io_json_error)?;
+    }
+    tokio::fs::rename(&temp_path, &local)
+        .await
+        .map_err(io_json_error)?;
+
+    let sha256 = response.headers.get("x-re-sha256").cloned();
+    Ok(FileTransferOutcome {
+        status: response.status,
+        bytes,
+        headers: response.headers,
+        sha256,
+        file: None,
+        message: format!(
+            "Downloaded {bytes} bytes: {target_path} -> {}",
+            local.display()
+        ),
+    })
+}
+
+async fn upload_file_transfer(
+    url: &str,
+    headers: &serde_json::Map<String, Value>,
+    local_path: &str,
+    target_path: &str,
+) -> Result<FileTransferOutcome, JsonRpcError> {
+    let endpoint = parse_file_transfer_url(url)?;
+    let local = PathBuf::from(local_path);
+    let mut file = tokio::fs::File::open(&local).await.map_err(io_json_error)?;
+    let size = file.metadata().await.map_err(io_json_error)?.len();
+    let mut stream = TcpStream::connect(&endpoint.addr)
+        .await
+        .map_err(io_json_error)?;
+    write_file_transfer_request_head(&mut stream, "PUT", &endpoint, headers, Some(size)).await?;
+    let mut sent = 0u64;
+    let mut buf = [0u8; 1024 * 64];
+    loop {
+        let read = file.read(&mut buf).await.map_err(io_json_error)?;
+        if read == 0 {
+            break;
+        }
+        stream
+            .write_all(&buf[..read])
+            .await
+            .map_err(io_json_error)?;
+        sent += read as u64;
+    }
+    stream.flush().await.map_err(io_json_error)?;
+
+    let response = read_file_transfer_response(&mut stream).await?;
+    let body = read_remaining_body(&mut stream, response.body_start)
+        .await
+        .map_err(io_json_error)?;
+    if response.status != 200 {
+        return Err(file_transfer_status_error(response.status, body));
+    }
+    let body_json = serde_json::from_slice::<Value>(&body).ok();
+    let bytes = body_json
+        .as_ref()
+        .and_then(|value| value.get("bytes"))
+        .and_then(Value::as_u64)
+        .unwrap_or(sent);
+    let sha256 = body_json
+        .as_ref()
+        .and_then(|value| value.get("sha256"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let file = body_json
+        .as_ref()
+        .and_then(|value| value.get("file"))
+        .cloned();
+    Ok(FileTransferOutcome {
+        status: response.status,
+        bytes,
+        headers: response.headers,
+        sha256,
+        file,
+        message: format!(
+            "Uploaded {bytes} bytes: {} -> {target_path}",
+            local.display()
+        ),
+    })
+}
+
+fn parse_file_transfer_url(url: &str) -> Result<FileTransferEndpoint, JsonRpcError> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| {
+        JsonRpcError::internal(format!(
+            "REFS file_transfer currently performs plain HTTP transfers; unsupported URL: {url}"
+        ))
+    })?;
+    let (host, path) = rest
+        .split_once('/')
+        .map(|(host, path)| (host, format!("/{path}")))
+        .unwrap_or((rest, "/".to_string()));
+    let addr = if host.rsplit_once(':').is_some() || host.starts_with('[') {
+        host.to_string()
+    } else {
+        format!("{host}:80")
+    };
+    Ok(FileTransferEndpoint {
+        host: host.to_string(),
+        addr,
+        path,
+    })
+}
+
+async fn write_file_transfer_request_head(
+    stream: &mut TcpStream,
+    method: &str,
+    endpoint: &FileTransferEndpoint,
+    headers: &serde_json::Map<String, Value>,
+    content_length: Option<u64>,
+) -> Result<(), JsonRpcError> {
+    let mut head = format!(
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        endpoint.path, endpoint.host
+    );
+    let mut entries = headers.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+    for (key, value) in entries {
+        head.push_str(key);
+        head.push_str(": ");
+        head.push_str(&sanitize_http_header_value(
+            value.as_str().unwrap_or_default(),
+        ));
+        head.push_str("\r\n");
+    }
+    if let Some(content_length) = content_length {
+        head.push_str(&format!("Content-Length: {content_length}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(io_json_error)?;
+    Ok(())
+}
+
+async fn read_file_transfer_response(
+    stream: &mut TcpStream,
+) -> Result<FileTransferHttpResponse, JsonRpcError> {
+    let mut buf = Vec::<u8>::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        let read = stream.read(&mut chunk).await.map_err(io_json_error)?;
+        if read == 0 {
+            return Err(JsonRpcError::internal(
+                "file transfer connection closed before response headers",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..read]);
+        if buf.len() > FILE_TRANSFER_MAX_HEADER_BYTES {
+            return Err(JsonRpcError::internal(format!(
+                "file transfer response headers exceed {FILE_TRANSFER_MAX_HEADER_BYTES} bytes"
+            )));
+        }
+        if let Some(pos) = find_http_header_end(&buf) {
+            break pos;
+        }
+    };
+    let head = std::str::from_utf8(&buf[..header_end])
+        .map_err(|err| JsonRpcError::internal(format!("response headers are not UTF-8: {err}")))?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines
+        .next()
+        .ok_or_else(|| JsonRpcError::internal("missing HTTP status line"))?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| JsonRpcError::internal(format!("invalid HTTP status line: {status_line}")))?
+        .parse::<u16>()
+        .map_err(|err| JsonRpcError::internal(format!("invalid HTTP status: {err}")))?;
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            return Err(JsonRpcError::internal(format!(
+                "invalid HTTP response header: {line}"
+            )));
+        };
+        headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+    Ok(FileTransferHttpResponse {
+        status,
+        headers,
+        body_start: buf[header_end + 4..].to_vec(),
+    })
+}
+
+async fn read_remaining_body(
+    stream: &mut TcpStream,
+    mut body: Vec<u8>,
+) -> std::io::Result<Vec<u8>> {
+    let mut buf = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..read]);
+    }
+    Ok(body)
+}
+
+fn file_transfer_status_error(status: u16, body: Vec<u8>) -> JsonRpcError {
+    let message = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(&body).trim().to_string());
+    JsonRpcError::internal(format!(
+        "file transfer HTTP {status}: {}",
+        if message.is_empty() {
+            "empty response"
+        } else {
+            &message
+        }
+    ))
+}
+
+fn local_download_temp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "download".into());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(
+        ".{name}.refs-download-{}-{now}.tmp",
+        std::process::id()
+    ))
+}
+
+fn find_http_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn sanitize_http_header_value(value: &str) -> String {
+    value.replace(['\r', '\n'], " ")
+}
+
+fn io_json_error(err: std::io::Error) -> JsonRpcError {
+    JsonRpcError::internal(err.to_string())
 }
 
 fn is_windows_absolute_path(path: &str) -> bool {

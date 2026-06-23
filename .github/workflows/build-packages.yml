@@ -151,9 +151,9 @@ jobs:
           cp "target/${target}/release/rec_mcp_demo" "dist/${pkg}/"
           cp "target/${target}/release/rec_mcp_memory_server" "dist/${pkg}/"
           cp "target/${target}/release/rec_mcp_memory_ws_server" "dist/${pkg}/"
-          cp README.md MCP.md "dist/${pkg}/"
+          cp AGENTS.md MCP.md "dist/${pkg}/"
           cp "target/${target}/release/refs-ptyt" "dist/${ptyt_pkg}/"
-          cp README.md MCP.md "dist/${ptyt_pkg}/"
+          cp AGENTS.md MCP.md "dist/${ptyt_pkg}/"
           tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
           tar -C dist -czf "dist/${ptyt_pkg}.tar.gz" "${ptyt_pkg}"
 
@@ -169,10 +169,10 @@ jobs:
           Copy-Item "target/$target/release/rec_mcp_demo.exe" "dist/$pkg/"
           Copy-Item "target/$target/release/rec_mcp_memory_server.exe" "dist/$pkg/"
           Copy-Item "target/$target/release/rec_mcp_memory_ws_server.exe" "dist/$pkg/"
-          Copy-Item "README.md" "dist/$pkg/"
+          Copy-Item "AGENTS.md" "dist/$pkg/"
           Copy-Item "MCP.md" "dist/$pkg/"
           Copy-Item "target/$target/release/refs-ptyt.exe" "dist/$ptytPkg/"
-          Copy-Item "README.md" "dist/$ptytPkg/"
+          Copy-Item "AGENTS.md" "dist/$ptytPkg/"
           Copy-Item "MCP.md" "dist/$ptytPkg/"
           Compress-Archive -Path "dist/$pkg/*" -DestinationPath "dist/$pkg.zip" -Force
           Compress-Archive -Path "dist/$ptytPkg/*" -DestinationPath "dist/$ptytPkg.zip" -Force

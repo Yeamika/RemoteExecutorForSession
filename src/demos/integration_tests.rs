@@ -2106,6 +2106,17 @@ async fn exbash_cleanup_syncs_host_tracking() {
 #[tokio::test]
 async fn manager_executor_config_uses_workspace_host_store() {
     let caller = new_manager().await.unwrap();
+    let remote_caller = new_manager().await.unwrap();
+    let remote_list = crate::rec::manager_handle(
+        &remote_caller,
+        serde_json::from_value(json!({"id":1,"tool":"list_executor","params":{}})).unwrap(),
+    )
+    .await;
+    let remote_url = serde_json::to_value(&remote_list.result).unwrap()["metadata"]["executors"][0]
+        ["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let shared_manager = Arc::new(caller);
     let shell_manager = ShellManager::default_shell(80, 24);
     let dir = tempfile::tempdir().unwrap();
@@ -2154,7 +2165,7 @@ async fn manager_executor_config_uses_workspace_host_store() {
         json!({
             "method":"connect_to_executor",
             "id":"exec_cfg",
-            "url":"127.0.0.1:65535",
+            "url":remote_url,
             "system":"linux",
             "device":"cfg-device",
             "labels":{"role":"test"}
@@ -2165,7 +2176,7 @@ async fn manager_executor_config_uses_workspace_host_store() {
     let output = text(&connect);
     assert!(
         output.contains("- exec_cfg")
-            && output.contains("url=ws://127.0.0.1:65535")
+            && output.contains("url=ws://")
             && output.contains("labels=role=test"),
         "{output}"
     );
@@ -2176,7 +2187,7 @@ async fn manager_executor_config_uses_workspace_host_store() {
         .config;
     assert!(stored.get("default").is_none());
     assert_eq!(stored["executors"][0]["id"], "exec_cfg");
-    assert_eq!(stored["executors"][0]["url"], "ws://127.0.0.1:65535");
+    assert_eq!(stored["executors"][0]["url"], remote_url);
 
     let list = call_structured(
         &ep,
@@ -2193,8 +2204,64 @@ async fn manager_executor_config_uses_workspace_host_store() {
 }
 
 #[tokio::test]
+async fn manager_connect_rejects_unverified_executor_without_writing_config() {
+    let caller = new_manager().await.unwrap();
+    let shared_manager = Arc::new(caller);
+    let shell_manager = ShellManager::default_shell(80, 24);
+    let dir = tempfile::tempdir().unwrap();
+    let host = Arc::new(MemorySessionHost::new(
+        "ses_manager_bad_connect",
+        dir.path().to_string_lossy(),
+    ));
+    let ctx = ToolContext::new(Some(dir.path().to_path_buf()));
+    let ep = JsonRpcEndpoint::new(create_session_mcp_with_manager(
+        ctx,
+        host.clone(),
+        shared_manager,
+        shell_manager,
+    ));
+
+    let connect = call_structured(
+        &ep,
+        "ses_manager_bad_connect",
+        "RemoteExecutorManager",
+        json!({
+            "method":"connect_to_executor",
+            "id":"bad_exec",
+            "url":"ws://127.0.0.1:9"
+        }),
+    )
+    .await;
+    assert!(
+        !connect["error"].is_null(),
+        "bad executor connect should fail: {connect:?}"
+    );
+    let stored = host
+        .read_remote_executor_config(&dir.path().to_string_lossy())
+        .await
+        .unwrap()
+        .config;
+    assert!(stored
+        .get("executors")
+        .and_then(Value::as_array)
+        .map(|executors| executors.is_empty())
+        .unwrap_or(true));
+}
+
+#[tokio::test]
 async fn manager_executor_config_normalizes_legacy_array_on_connect() {
     let caller = new_manager().await.unwrap();
+    let remote_caller = new_manager().await.unwrap();
+    let remote_list = crate::rec::manager_handle(
+        &remote_caller,
+        serde_json::from_value(json!({"id":1,"tool":"list_executor","params":{}})).unwrap(),
+    )
+    .await;
+    let remote_url = serde_json::to_value(&remote_list.result).unwrap()["metadata"]["executors"][0]
+        ["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let shared_manager = Arc::new(caller);
     let shell_manager = ShellManager::default_shell(80, 24);
     let dir = tempfile::tempdir().unwrap();
@@ -2239,7 +2306,7 @@ async fn manager_executor_config_normalizes_legacy_array_on_connect() {
         json!({
             "method":"connect_to_executor",
             "id":"next_exec",
-            "url":"ws://127.0.0.1:65534"
+            "url":remote_url
         }),
     )
     .await;
@@ -2303,11 +2370,12 @@ async fn manager_list_shells_routes_through_executor() {
 }
 
 #[tokio::test]
-async fn file_transfer_tool_prepares_same_port_http_request() {
+async fn file_transfer_tool_downloads_through_refs() {
     let caller = new_manager().await.unwrap();
     let shared_manager = Arc::new(caller);
     let shell_manager = ShellManager::default_shell(80, 24);
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("source.bin"), b"download through refs\n").unwrap();
     let host = Arc::new(MemorySessionHost::new(
         "ses_file_transfer",
         dir.path().to_string_lossy(),
@@ -2326,8 +2394,8 @@ async fn file_transfer_tool_prepares_same_port_http_request() {
         "file_transfer",
         json!({
             "mode":"download",
-            "localPath":"./payload.bin",
-            "targetPath":"payload.bin",
+            "localPath":"./downloaded.bin",
+            "targetPath":"source.bin",
             "executor":"local"
         }),
     )
@@ -2341,19 +2409,24 @@ async fn file_transfer_tool_prepares_same_port_http_request() {
     assert_eq!(structured["metadata"]["method"], json!("GET"));
     assert_eq!(
         structured["metadata"]["headers"]["X-RE-Path"],
-        json!("payload.bin")
+        json!("source.bin")
     );
     assert_eq!(
         structured["metadata"]["localPath"],
-        json!(dir.path().join("./payload.bin").to_string_lossy())
+        json!(dir.path().join("./downloaded.bin").to_string_lossy())
     );
-    assert_eq!(structured["metadata"]["targetPath"], json!("payload.bin"));
+    assert_eq!(structured["metadata"]["targetPath"], json!("source.bin"));
+    assert_eq!(structured["metadata"]["bytes"], json!(22));
     let url = structured["metadata"]["url"].as_str().unwrap_or_default();
     assert!(
         url.starts_with("http://") && url.ends_with("/re-file/v1"),
         "{url}"
     );
-    assert!(text(&prepared).contains("GET http://"));
+    assert!(text(&prepared).contains("Downloaded 22 bytes"));
+    assert_eq!(
+        std::fs::read(dir.path().join("downloaded.bin")).unwrap(),
+        b"download through refs\n"
+    );
 }
 
 #[tokio::test]
@@ -2364,6 +2437,7 @@ async fn file_transfer_local_path_accepts_local_hash_ref() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("source.bin");
     std::fs::write(&file, b"transfer source\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("incoming")).unwrap();
     let host = Arc::new(MemorySessionHost::new(
         "ses_file_transfer_hash_ref",
         dir.path().to_string_lossy(),
@@ -2426,6 +2500,11 @@ async fn file_transfer_local_path_accepts_local_hash_ref() {
         structured["metadata"]["headers"]["X-RE-Overwrite"],
         json!("true")
     );
+    assert_eq!(
+        std::fs::read(dir.path().join("incoming/source.bin")).unwrap(),
+        b"transfer source\n"
+    );
+    assert!(text(&prepared).contains("Uploaded 16 bytes"));
 }
 
 #[tokio::test]

@@ -1103,7 +1103,7 @@ Notes: remote executor tracking is lazy and updates after successful executor ca
 pub fn file_transfer() -> McpToolDef {
     tool_def(
         "file_transfer",
-        "Prepare same-port HTTP file transfer request metadata. Use `mode=\"download\"` for targetPath -> localPath, and `mode=\"upload\"` for localPath -> targetPath. `localPath` is the caller/opencode side path and accepts local hashRef/fileRef labels or relative paths resolved from the current session workspace. `targetPath` is the selected executor side path. The file bytes are transferred outside MCP by connecting to the returned URL with the returned method and headers.",
+        "Transfer file bytes through REFS using the selected RemoteExecutor's same-port HTTP file transfer endpoint. Use `mode=\"download\"` for targetPath -> localPath, and `mode=\"upload\"` for localPath -> targetPath. `localPath` is the caller/opencode side path and accepts local hashRef/fileRef labels or relative paths resolved from the current session workspace. `targetPath` is the selected executor side path. REFS performs the transfer and returns success/failure metadata; the agent does not need to download/upload manually.",
         vec!["mode", "localPath", "targetPath"],
         vec![
             exec_session_prop(),
